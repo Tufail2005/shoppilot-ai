@@ -1,0 +1,308 @@
+# =========================================================
+# OS / System
+# =========================================================
+
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+
+# =========================================================
+# Environment / Secrets
+# =========================================================
+
+.env
+.env.*
+!.env.example
+
+# Local environment overrides
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Supabase local secrets/config generated files
+supabase/.env
+supabase/.temp/
+
+
+# =========================================================
+# Node.js / Next.js
+# =========================================================
+
+node_modules/
+
+# Next.js
+.next/
+out/
+.vercel/
+
+# Next.js build/debug
+next-env.d.ts
+
+# npm
+.npm/
+npm-debug.log*
+npm-error.log*
+
+# Yarn
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+yarn-debug.log*
+yarn-error.log*
+
+# pnpm
+.pnpm-debug.log*
+
+# Bun
+bun.lockb
+bun-debug.log*
+
+
+# =========================================================
+# TypeScript
+# =========================================================
+
+*.tsbuildinfo
+
+
+# =========================================================
+# Python
+# =========================================================
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Wheels
+*.whl
+
+# pytest
+.pytest_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Pylint
+.pylint.d/
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# =========================================================
+# uv
+# =========================================================
+
+# uv local cache
+.uv/
+
+# IMPORTANT:
+# Keep uv.lock committed to Git for reproducible builds.
+
+
+# =========================================================
+# Supabase CLI
+# =========================================================
+
+# Local Supabase generated/runtime files
+supabase/.temp/
+
+# Supabase local database volumes/state
+supabase/.branches/
+
+# Do NOT ignore these:
+# supabase/config.toml
+# supabase/migrations/
+# supabase/seed.sql
+
+
+# =========================================================
+# Docker
+# =========================================================
+
+# Local Docker override files
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Docker environment files
+docker.env
+
+# Docker logs
+*.log
+
+# Local Docker data/volumes
+.docker/
+
+
+# =========================================================
+# Logs
+# =========================================================
+
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+uvicorn.log
+
+
+# =========================================================
+# Testing
+# =========================================================
+
+.pytest_cache/
+.tox/
+.nox/
+*.snap
+
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+
+
+# =========================================================
+# IDE / Editors
+# =========================================================
+
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+
+# Emacs
+*~
+\#*\#
+
+# JetBrains
+.idea/
+
+
+# =========================================================
+# Temporary files
+# =========================================================
+
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.swp
+*.swo
+
+
+# =========================================================
+# Database / Local data
+# =========================================================
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Local database dumps
+*.dump
+*.sql.gz
+
+# NOTE:
+# Do NOT ignore Supabase migrations or seed files.
+# They are part of the project source code.
+
+
+# =========================================================
+# Uploads / Generated files
+# =========================================================
+
+# Local uploaded documents
+uploads/
+tmp/
+temp/
+
+# Generated AI/RAG artifacts
+artifacts/
+generated/
+embeddings/
+
+# Keep directories if needed:
+# !uploads/.gitkeep
+# !generated/.gitkeep
+
+
+# =========================================================
+# Build / Cache
+# =========================================================
+
+.cache/
+.parcel-cache/
+.turbo/
+.eslintcache
+
+
+# =========================================================
+# Misc
+# =========================================================
+
+*.pid
+*.seed
+*.pid.lock
+
+# Local reports
+reports/
+
+# Secrets / certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Service account files
+service-account*.json
+*-credentials.json
