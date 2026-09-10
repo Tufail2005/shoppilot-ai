@@ -18,6 +18,18 @@ dependencies = [
 requires = ["uv_build>=0.12.1,<0.13.0"]
 build-backend = "uv_build"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "httpx>=0.28.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests run against the local Supabase database by default (see tests/conftest.py).
+# The application .env (remote DATABASE_URL) is never used by pytest.
+# Override with TEST_DATABASE_URL if a dedicated test database is required.
+
 [tool.uv.build-backend]
 module-name = "app"
 module-root = ""
