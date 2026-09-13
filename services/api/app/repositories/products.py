@@ -20,6 +20,7 @@ async def list_products(
     offset: int,
     category: str | None,
 ) -> tuple[list[dict], int]:
+    
     params: list = []
     where_clauses: list[str] = []
 
@@ -34,7 +35,7 @@ async def list_products(
     row = await cursor.fetchone()
     total = row[0] if row else 0
 
-    page_sql = f"""
+    page_sql = f""" 
         SELECT {_PRODUCT_COLUMNS}
         FROM public.products{where_sql}
         ORDER BY created_at DESC, id
@@ -69,3 +70,4 @@ async def get_product_by_id(
 
     column_names = [desc.name for desc in cursor.description]
     return dict(zip(column_names, row, strict=True))
+ 

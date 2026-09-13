@@ -1,3 +1,8 @@
+import { Architecture } from "./components/home/architecture";
+import { Footer } from "./components/home/footer";
+import { Hero } from "./components/home/hero";
+import { HowItWorks } from "./components/home/how-it-works";
+import { Navbar } from "./components/home/navbar";
 import { getApiHealth } from "@/lib/api";
 
 export default async function Home() {
@@ -11,19 +16,13 @@ export default async function Home() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center">
-      <div className="space-y-4 text-center">
-        <h1 className="text-3xl font-semibold">
-          ShopPilot AI
-        </h1>
-
-        <p>
-          API:{" "}
-          <span className="font-mono">
-            {apiStatus}
-          </span>
-        </p>
-      </div>
+    <main className="min-h-screen overflow-x-hidden bg-[#f7f5f0] text-[#171717]">
+      <Navbar />
+      <Hero />
+      {/* <Stats /> */}
+      <HowItWorks />
+      <Architecture />
+      <Footer apiStatus={apiStatus} />
     </main>
   );
 }
