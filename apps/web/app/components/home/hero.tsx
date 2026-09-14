@@ -56,7 +56,7 @@ return (
             {/* Heading */}
             <h1 className="text-[44px] sm:text-6xl lg:text-[72px] font-bold leading-[1.05] tracking-tight text-[#111] mb-8">
               Turn customer<br className="hidden sm:block" /> conversations into <br className="hidden sm:block" />
-              <span className="text-[#8C7A6B]">growth.</span>
+              <span className="text-[#8C7A6B]">resolution.</span>
             </h1>
 
             {/* Description */}

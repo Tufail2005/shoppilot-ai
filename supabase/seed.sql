@@ -34,37 +34,6 @@ values
     '{"full_name":"Emma Davis"}'
 );
 
-insert into public.profiles (
-    id,
-    role,
-    full_name
-)
-values
-(
-    '00000000-0000-0000-0000-000000000001',
-    'customer',
-    'Alice Johnson'
-),
-(
-    '00000000-0000-0000-0000-000000000002',
-    'customer',
-    'Bob Smith'
-),
-(
-    '00000000-0000-0000-0000-000000000003',
-    'customer',
-    'Carol Williams'
-),
-(
-    '00000000-0000-0000-0000-000000000004',
-    'customer',
-    'David Brown'
-),
-(
-    '00000000-0000-0000-0000-000000000005',
-    'customer',
-    'Emma Davis'
-);
 
 
 -- =========================================================
