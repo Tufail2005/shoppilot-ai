@@ -1,10 +1,10 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-import { getSupabaseClientConfig } from "@/lib/supabase/env";
+import { getSupabaseServerConfig } from "@/lib/supabase/env";
 
 export async function proxy(request: NextRequest) {
-  const { url, anonKey } = getSupabaseClientConfig();
+  const { url, anonKey } = getSupabaseServerConfig();
 
   let supabaseResponse = NextResponse.next({
     request,
@@ -29,17 +29,23 @@ export async function proxy(request: NextRequest) {
     },
   });
 
-  // Do not run code between createServerClient and auth.getUser().
-  // A simple mistake can make the session appear logged in for a stale JWT.
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
-  // Phase 3.7 will add role/dashboard redirects here.
-  // This middleware currently only refreshes and propagates the session.
-  void user;
+const isDashboardRoute = request.nextUrl.pathname.startsWith("/dashboard");
 
+ if (isDashboardRoute && !user) {
+     const loginUrl = request.nextUrl.clone(); 
+     loginUrl.pathname = "/login";
+     loginUrl.searchParams.set("redirectTo", request.nextUrl.pathname);
+    
+    return NextResponse.redirect(loginUrl);
+  
+  }
+  
   return supabaseResponse;
+
 }
 
 export const config = {

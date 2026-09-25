@@ -10,3 +10,19 @@ export function getSupabaseClientConfig() {
 
   return { url, anonKey };
 }
+
+export function getSupabaseServerConfig() {
+  const url =
+    process.env.SUPABASE_SERVER_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL;
+
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!url || !anonKey) {
+    throw new Error(
+      "Missing Supabase server environment variables.",
+    );
+  }
+
+  return { url, anonKey };
+}
