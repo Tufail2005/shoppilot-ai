@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import init_db
-from app.routers import products, orders
+from app.routers import products, orders, tickets
 
 from fastapi import Depends
 
@@ -35,6 +35,7 @@ app.add_middleware(
 
 app.include_router(products.router)
 app.include_router(orders.router)
+app.include_router(tickets.router)
 
 
 @app.get("/health")

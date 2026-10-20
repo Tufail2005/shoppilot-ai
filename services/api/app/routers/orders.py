@@ -6,7 +6,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.auth import get_current_user
 from app.db import get_db
-from app.schemas.orders import OrderListOut
+from app.schemas.orders import OrderListOut, OrderOut
 from app.services import orders as orders_service
 
 
@@ -44,3 +44,26 @@ async def list_orders(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/{order_id}", response_model=OrderOut)
+async def get_order(
+    order_id: uuid.UUID,
+    current_user: Annotated[
+        dict,
+        Depends(get_current_user),
+    ],
+    pool: AsyncConnectionPool = Depends(get_db),
+):
+    # Identity comes from the verified Supabase JWT.
+    user_id = uuid.UUID(current_user["id"])
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cursor:
+            order = await orders_service.get_order(
+                cursor,
+                user_id=user_id,
+                order_id=order_id,
+            )
+
+    return order

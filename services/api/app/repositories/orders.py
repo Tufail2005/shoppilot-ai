@@ -62,3 +62,38 @@ async def list_orders(
     ]
 
     return items, total
+
+
+async def get_order(
+    cursor: AsyncCursor,
+    *,
+    order_id: uuid.UUID,
+    customer_id: uuid.UUID | None = None,
+) -> dict | None:
+    """
+    Fetch a single order by ID with optional customer_id filtering.
+    
+    If customer_id is provided, the order must belong to that customer.
+    If customer_id is None, any order matching the ID is returned (admin/support_agent).
+    """
+    params: list = [order_id]
+    where_sql = "WHERE id = %s"
+
+    if customer_id is not None:
+        where_sql += " AND customer_id = %s"
+        params.append(customer_id)
+
+    sql = f"""
+        SELECT {_ORDER_COLUMNS}
+        FROM public.orders
+        {where_sql}
+    """
+
+    await cursor.execute(sql, params)
+    row = await cursor.fetchone()
+
+    if row is None:
+        return None
+
+    column_names = [column.name for column in cursor.description]
+    return dict(zip(column_names, row, strict=True))

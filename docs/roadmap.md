@@ -84,27 +84,36 @@ Verification failures are fixed before the step is considered complete.
 
 Completed:
 - Phase 1 — Foundation
-- Phase 2 — Database
-- Seed data
+- Phase 2 — Database and Seed data
 - Docker Compose for web + API
 - Next.js → FastAPI health check
+- phase 3.1-3.9 -- Auth + RBAC
+- phase 3.10 -- RLS policies implemented; local runtime checks passed and cloud order/ticket checks verified
 - Phase 4.2 — GET /products
 - Phase 4.2 — GET /products/{id}
 - Phase 4.2 integration tests against local Supabase
+- phase 4.3 -- GET /orders
 
-Not started:
-- Phase 3 — Auth + RBAC
 
-Current target:
+# Current target:
 
-Phase 3 — Auth + RBAC
+Phase 4.4 —— GET /orders/{id} with server-side resource ownership and role checks.
 
-- Phase 4.2 was implemented before Phase 3 because the product endpoints are public and do not require authentication.
-- Phase 3 must be completed before implementing Phase 4.3 or any protected endpoint.
+# Next target:
 
-Next target:
+Phase 4.4 — Implement and test GET /orders/{id}.
 
-Phase 4.3 — GET /orders
+# Sequencing notes:
+
+- Phase 4.2 was implemented before Phase 3 because product endpoints are public.
+
+- Phase 3 must be completed before protected endpoints are implemented. The current Phase 4.3 endpoint is implemented and its core access checks have been tested; remaining Phase 3 security-matrix checks must still be tracked and completed.
+
+- Continue with Phase 4.4 without skipping later Phase 4 steps.
+
+- Include user ID, customer ID, and role spoofing checks in the relevant protected-endpoint tests.
+
+- Do not mark a roadmap step complete unless its implementation and required verification have actually been performed.
 
 ## Phase 1 — Foundation (Micro-steps)
 
