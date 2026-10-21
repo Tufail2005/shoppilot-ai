@@ -3,10 +3,10 @@ import uuid
 from fastapi import HTTPException, status
 from psycopg import AsyncCursor
 
-from app.repositories import orders as orders_repository
 from app.repositories import profiles as profiles_repository
 from app.repositories import tickets as tickets_repository
 
+from app.services import ownership
 
 async def _get_role(
     cursor: AsyncCursor,
@@ -95,17 +95,11 @@ async def create_ticket(
 
     # If an order is linked, it must belong to this customer.
     if order_id is not None:
-        order = await orders_repository.get_order(
+        await ownership.assert_can_access_order(
             cursor,
+            user_id=user_id,
             order_id=order_id,
-            customer_id=user_id,
         )
-
-        if order is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Order not found",
-            )
 
     # The authenticated user determines customer_id.
     # Never accept customer_id from the request body.

@@ -93,27 +93,16 @@ Completed:
 - Phase 4.2 — GET /products/{id}
 - Phase 4.2 integration tests against local Supabase
 - phase 4.3 -- GET /orders
-
+- Phase 4.4 —— GET /orders/{id} with server-side resource ownership and role checks.
 
 # Current target:
 
-Phase 4.4 —— GET /orders/{id} with server-side resource ownership and role checks.
+phase 4.8 : Test matrix: run each endpoint as customer / agent / admin / anon, record expected vs actual
 
 # Next target:
 
-Phase 4.4 — Implement and test GET /orders/{id}.
+phase 4.9 : Wire a minimal frontend page listing products to verify end-to-end
 
-# Sequencing notes:
-
-- Phase 4.2 was implemented before Phase 3 because product endpoints are public.
-
-- Phase 3 must be completed before protected endpoints are implemented. The current Phase 4.3 endpoint is implemented and its core access checks have been tested; remaining Phase 3 security-matrix checks must still be tracked and completed.
-
-- Continue with Phase 4.4 without skipping later Phase 4 steps.
-
-- Include user ID, customer ID, and role spoofing checks in the relevant protected-endpoint tests.
-
-- Do not mark a roadmap step complete unless its implementation and required verification have actually been performed.
 
 ## Phase 1 — Foundation (Micro-steps)
 
