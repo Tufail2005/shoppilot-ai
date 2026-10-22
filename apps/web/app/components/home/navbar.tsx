@@ -23,6 +23,13 @@ export function Navbar() {
         </Link>
 
         <nav className="hidden items-center gap-8 md:flex">
+          <Link
+            href="/products"
+            className="text-sm text-black/60 transition hover:text-black"
+          >
+            Products
+          </Link>
+
           <a
             href="#product"
             className="text-sm text-black/60 transition hover:text-black"

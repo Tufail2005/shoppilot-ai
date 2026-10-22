@@ -97,11 +97,11 @@ Completed:
 
 # Current target:
 
-phase 4.8 : Test matrix: run each endpoint as customer / agent / admin / anon, record expected vs actual
+phase 4.9 : Wire a minimal frontend page listing products to verify end-to-end
 
 # Next target:
 
-phase 4.9 : Wire a minimal frontend page listing products to verify end-to-end
+phase 5.1 : Create a Storage bucket documents in Supabase
 
 
 ## Phase 1 — Foundation (Micro-steps)
