@@ -94,14 +94,22 @@ Completed:
 - Phase 4.2 integration tests against local Supabase
 - phase 4.3 -- GET /orders
 - Phase 4.4 —— GET /orders/{id} with server-side resource ownership and role checks.
+- phase 4.5 — GET /tickets, POST /tickets, GET /tickets/{id}, PATCH /tickets/{id} (update = agents only)
+- phase 4.6 — Pydantic schemas for all request/response models
+- phase 4.7 — ownership-check helper: assert_can_access_order(user, order_id)
+- phase 4.8 — Test matrix: run each endpoint as customer / agent / admin / anon, record expected vs actual
+- phae 4.9 — Wire a minimal frontend page listing products to verify end-to-end
+- phase 5.1 — Create a Storage bucket documents in Supabase
+- phase 5.2 — FastAPI POST /admin/documents: PDF upload validates content (%PDF- signature, 20 MiB limit), stores to private `documents` bucket under server-generated path, inserts documents row with status=processing; visibility explicitly internal by default (public = admin only)
 
 # Current target:
 
-phase 4.9 : Wire a minimal frontend page listing products to verify end-to-end
+phase 5.3 — Add pypdf dependency; write extract_text(file) -> str
+
 
 # Next target:
 
-phase 5.1 : Create a Storage bucket documents in Supabase
+phase 5.4 — Write chunking function: split by ~800 tokens with 100-token overlap
 
 
 ## Phase 1 — Foundation (Micro-steps)
