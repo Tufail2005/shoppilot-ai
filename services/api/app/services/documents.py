@@ -1,11 +1,15 @@
+import io
 import logging
 import uuid
+from typing import BinaryIO
 
+import pypdf
 from fastapi import HTTPException, UploadFile, status
 from psycopg_pool import AsyncConnectionPool
 from supabase import Client
 
 from app.repositories import documents as documents_repository
+from app.storage import DOCUMENTS_BUCKET
 
 
 logger = logging.getLogger(__name__)
@@ -15,10 +19,73 @@ logger = logging.getLogger(__name__)
 MAX_DOCUMENT_SIZE = 20 * 1024 * 1024  # 20 MiB = 20,971,520 bytes
 
 _PDF_SIGNATURE = b"%PDF-"
-_STORAGE_BUCKET = "documents"
 _READ_CHUNK_SIZE = 64 * 1024
 _TITLE_MAX_LENGTH = 200
 _DEFAULT_TITLE = "Untitled Document"
+
+
+class PDFExtractionError(Exception):
+    """Raised when text cannot be extracted from a PDF.
+
+    Reported for: input of an unsupported type, PDFs that cannot be
+    parsed (corrupt, truncated, empty), password-protected (encrypted)
+    PDFs, and valid PDFs that contain no extractable text layer.
+
+    pypdf does not perform OCR. A scanned/image-only PDF is a valid PDF
+    without a text layer: it is reported the same as any other textless
+    PDF by raising this error, and the absence of extractable text
+    cannot in general be attributed to a specific cause.
+    """
+
+
+def extract_text(file: bytes | BinaryIO) -> str:
+    """Extract the text of a PDF from all pages, preserving page order.
+
+    Accepts raw PDF bytes or a binary file-like object. Seekable
+    streams are reset to the beginning before reading.
+
+    Returns a non-empty extracted text string on success.
+
+    Raises PDFExtractionError when the input type is invalid, the PDF
+    cannot be parsed, the PDF is encrypted, or the PDF yields no
+    extractable text. pypdf does not perform OCR, so the text layer of
+    a scanned/image-only PDF looks exactly like that of any other
+    textless PDF and extraction fails instead of returning empty text.
+
+    This function never logs document contents or extracted text.
+    """
+    if isinstance(file, bytes):
+        stream: io.BytesIO | BinaryIO = io.BytesIO(file)
+    elif callable(getattr(file, "read", None)) and callable(getattr(file, "seek", None)):
+        file.seek(0)
+        stream = file
+    else:
+        raise PDFExtractionError(
+            "Expected PDF bytes or a binary file-like object, "
+            f"got {type(file).__name__}"
+        )
+
+    try:
+        reader = pypdf.PdfReader(stream)
+    except Exception as exc:
+        raise PDFExtractionError("PDF could not be parsed") from exc
+
+    if reader.is_encrypted:
+        raise PDFExtractionError(
+            "PDF is encrypted and cannot be extracted without a password"
+        )
+
+    try:
+        page_texts = [page.extract_text() for page in reader.pages]
+    except Exception as exc:
+        raise PDFExtractionError("PDF text could not be extracted") from exc
+
+    text = "\n".join(page_text for page_text in page_texts if page_text.strip())
+
+    if not text.strip():
+        raise PDFExtractionError("PDF contains no extractable text")
+
+    return text
 
 
 def _derive_title(filename: str | None) -> str:
@@ -55,17 +122,18 @@ def _upload_to_storage(
     data: bytes,
 ) -> None:
     try:
-        storage.from_(_STORAGE_BUCKET).upload(
+        storage.from_(DOCUMENTS_BUCKET).upload(
             path=storage_path,
             file=data,
             file_options={"content-type": "application/pdf"},
         )
     except Exception as exc:
+        # Log the stage and exception type only. Storage SDK error
+        # messages can contain the internal storage path or bucket URL,
+        # which must never appear in logs.
         logger.error(
-            "Storage upload failed for %s: %s: %s",
-            storage_path,
+            "Storage upload failed: %s",
             type(exc).__name__,
-            exc,
         )
 
         raise HTTPException(
@@ -76,13 +144,17 @@ def _upload_to_storage(
 
 def _remove_object_safely(storage: Client, storage_path: str) -> None:
     # Cleanup must never hide the original failure.
+    # The storage_path parameter is used only for the remove() call:
+    # it is never logged, because internal storage paths must not be
+    # exposed through log output. The exception type is logged without
+    # its message for the same reason.
     try:
-        storage.from_(_STORAGE_BUCKET).remove([storage_path])
-    except Exception:
-        logger.exception(
-            "Failed to remove Storage object %s "
-            "after failed document registration",
-            storage_path,
+        storage.from_(DOCUMENTS_BUCKET).remove([storage_path])
+    except Exception as exc:
+        logger.error(
+            "Failed to remove Storage object after failed document "
+            "registration: %s",
+            type(exc).__name__,
         )
 
 
@@ -166,9 +238,14 @@ async def upload_document(
 
             await conn.commit()
     except Exception as exc:
-        logger.exception(
-            "Failed to register document %s after Storage upload",
-            storage_path,
+        # The underlying database error is not logged with its message
+        # or traceback: only the stage and exception type. Database
+        # error text is uncontrolled and has previously carried query
+        # context; document registration failures must not reintroduce
+        # internal identifiers into logs.
+        logger.error(
+            "Failed to register document after Storage upload: %s",
+            type(exc).__name__,
         )
 
         _remove_object_safely(storage, storage_path)

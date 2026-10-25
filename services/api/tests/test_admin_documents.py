@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 
@@ -431,3 +432,92 @@ class TestStoredObjectPath:
         assert response.json()["title"] == "Untitled Document"
 
         _delete_document(response.json()["id"])
+
+
+class TestFailureLogging:
+    def test_failure_logs_do_not_expose_internal_storage_paths(
+        self,
+        admin_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Internal storage paths/URLs never reach logs or responses.
+
+        Scenario A: upload succeeds, document registration fails, and
+        the Storage cleanup also fails — the path would otherwise be
+        exposed through the upload, registration, and removal log
+        statements. Scenario B: the upload itself fails.
+
+        Response statuses and detail messages must remain exactly as
+        before the logging policy, and the storage path must appear in
+        neither.
+        """
+        caplog.set_level(logging.ERROR)
+
+        # Scenario A: registration and cleanup both fail.
+        state = FakeStorageState()
+        _install_fake_storage(state)
+
+        async def failing_create(*args, **kwargs):
+            raise RuntimeError("simulated database failure")
+
+        monkeypatch.setattr(
+            documents_repository,
+            "create_document",
+            failing_create,
+        )
+
+        def failing_remove(self, paths: list[str]) -> None:
+            raise RuntimeError("simulated cleanup failure")
+
+        monkeypatch.setattr(FakeStorageBucket, "remove", failing_remove)
+
+        response = admin_client.post(
+            "/admin/documents",
+            files={"file": ("doc.pdf", _VALID_PDF, "application/pdf")},
+        )
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Document could not be registered"}
+
+        internal_path = state.uploads[0]["path"]
+        assert internal_path.startswith("uploads/")
+
+        assert internal_path not in response.text
+
+        # Scenario B: the upload itself fails.
+        failing_state = FakeStorageState(fail_upload=True)
+        _install_fake_storage(failing_state)
+
+        response = admin_client.post(
+            "/admin/documents",
+            files={"file": ("doc.pdf", _VALID_PDF, "application/pdf")},
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": "Document storage is temporarily unavailable"
+        }
+
+        messages = "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+
+        # The internal storage path (and any URL) appears in neither
+        # the responses nor the captured log records.
+        assert internal_path not in messages
+        assert "uploads/" not in messages
+        assert "http" not in messages.lower()
+        assert internal_path not in response.text
+
+        # The log records identify the failing stage and exception
+        # type instead of uncontrolled error text.
+        assert "Storage upload failed: RuntimeError" in messages
+        assert (
+            "Failed to register document after Storage upload: RuntimeError"
+            in messages
+        )
+        assert (
+            "Failed to remove Storage object after failed document "
+            "registration: RuntimeError" in messages
+        )

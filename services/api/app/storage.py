@@ -3,6 +3,13 @@ from supabase import Client
 from app.auth import get_supabase_client
 
 
+# The private Storage bucket that holds uploaded knowledge-base PDFs
+# (see supabase/config.toml). Server-side code reaches it through the
+# service-role client; the bucket name is internal and must never be
+# exposed to customers or logged.
+DOCUMENTS_BUCKET = "documents"
+
+
 def get_storage() -> Client:
     """FastAPI dependency for the server-side Supabase Storage client.
 
