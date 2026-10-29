@@ -75,7 +75,7 @@ import uuid
 from collections.abc import Sequence
 
 from psycopg_pool import AsyncConnectionPool
-from supabase import Client
+from storage3 import SyncStorageClient
 
 from app.repositories import documents as documents_repository
 from app.services.chunking import DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP, chunk_text
@@ -130,7 +130,7 @@ def _log_failure(stage: str, document_id: uuid.UUID, exc: Exception) -> None:
 
 
 def _download_pdf(
-    storage: Client,
+    storage: SyncStorageClient,
     storage_path: str,
     document_id: uuid.UUID,
 ) -> bytes:
@@ -322,7 +322,7 @@ async def _embedded(
 
 async def ingest_document(
     pool: AsyncConnectionPool,
-    storage: Client,
+    storage: SyncStorageClient,
     embedding_provider: EmbeddingProvider,
     *,
     document_id: uuid.UUID,

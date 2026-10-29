@@ -73,6 +73,7 @@ import math
 from collections.abc import Sequence
 from typing import Protocol
 
+from fastapi import HTTPException, status
 from google.genai import types
 
 from app.core.config import get_settings
@@ -343,6 +344,35 @@ class GeminiEmbeddingProvider:
             validated.append(numeric)
 
         return validated
+
+
+def get_embedding_provider() -> EmbeddingProvider:
+    """FastAPI dependency resolving the embedding provider per request.
+
+    Configuration is resolved and validated here — before any PDF is
+    uploaded or document row is created — so a missing ``GEMINI_API_KEY``
+    can never leave an orphaned Storage object or a doomed ``processing``
+    document row. Calling the factory only now (never at import time)
+    matches the established conventions: importing this module creates
+    no client and requires no credentials.
+
+    A missing or unusable configuration surfaces as
+    :class:`EmbeddingError`, which is reported to the client as a
+    sanitized 503 — the error's own message could quote configuration
+    details and is never forwarded.
+    """
+    try:
+        return create_gemini_provider()
+    except EmbeddingError as exc:
+        logger.error(
+            "Embedding provider configuration is unusable: %s",
+            type(exc).__name__,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document ingestion is not configured",
+        ) from exc
 
 
 def create_gemini_provider() -> GeminiEmbeddingProvider:

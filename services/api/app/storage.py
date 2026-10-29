@@ -1,4 +1,4 @@
-from supabase import Client
+from storage3 import SyncStorageClient
 
 from app.auth import get_supabase_client
 
@@ -10,10 +10,22 @@ from app.auth import get_supabase_client
 DOCUMENTS_BUCKET = "documents"
 
 
-def get_storage() -> Client:
+def get_storage() -> SyncStorageClient:
     """FastAPI dependency for the server-side Supabase Storage client.
+
+    Returns the *Storage facade* of the service-role Supabase client:
+    ``Client.storage``. Every call site (upload, download, cleanup,
+    deletion) and every test fake addresses Storage through
+    ``storage.from_(bucket).upload/download/remove``.
+
+    The full ``supabase.Client`` must deliberately NOT be returned
+    here: on supabase-py 2.31.0 its ``from_`` is the PostgREST *table*
+    accessor (verify: it exposes no ``upload``/``remove``/``download``
+    methods), which raises ``AttributeError`` against the real Storage
+    service. JWT verification keeps its own full client through
+    ``app.auth.get_supabase_client``.
 
     Initialized from the existing Settings configuration and the
     service-role key, which never leaves the backend.
     """
-    return get_supabase_client()
+    return get_supabase_client().storage

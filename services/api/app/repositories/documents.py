@@ -11,6 +11,8 @@ _DOCUMENT_COLUMNS = """
     visibility,
     status,
     version,
+    failure_stage,
+    failure_message,
     created_at
 """
 
@@ -142,3 +144,193 @@ async def insert_document_chunks(
     await cursor.executemany(_INSERT_CHUNK_SQL, rows)
 
     return cursor.rowcount
+
+
+async def set_document_visibility(
+    cursor: AsyncCursor,
+    *,
+    document_id: uuid.UUID,
+    visibility: str,
+) -> dict | None:
+    """Set one document's visibility and return the updated row.
+
+    Phase 5.9: a non-transition metadata update. Unlike the guarded
+    status transitions above, there is deliberately NO `status` guard
+    on this statement: visibility is settable for every document
+    status (`processing`/`ready`/`failed`, matching the deletion
+    policy), and a single-statement UPDATE serializes safely with a
+    concurrent status write through Postgres row locking. Zero updated
+    rows therefore means only one thing — the document id does not
+    exist — and the caller reports 404.
+
+    The statement touches exactly `visibility` and `updated_at`
+    (explicit, because no trigger maintains it). It never alters
+    `status`, the failure fields, `title`, `version`, or the row's
+    `storage_path`, and it never touches document_chunks: chunks,
+    embeddings, and the Storage object are untouched by a visibility
+    change. `visibility` is a Pydantic-validated Literal bound as a
+    parameter.
+
+    The existing SELECT RLS policies evaluate the row's *current*
+    visibility value at query time, so the change takes effect
+    immediately for readers; no policy change is required.
+
+    Returns the updated document row (exactly one row updated), or
+    ``None`` when zero rows matched — the caller must report
+    not-found and never claim an update was persisted.
+    """
+
+    await cursor.execute(
+        f"""
+        UPDATE public.documents
+        SET
+            visibility = %s,
+            updated_at = now()
+        WHERE id = %s
+        RETURNING {_DOCUMENT_COLUMNS}
+        """,
+        [visibility, document_id],
+    )
+
+    return await _fetch_updated_row(cursor)
+
+
+async def mark_document_ready(
+    cursor: AsyncCursor,
+    *,
+    document_id: uuid.UUID,
+) -> dict | None:
+    """Transition one document from `processing` to `ready`.
+
+    The guard `status = 'processing'` makes the transition explicit
+    and one-way per row: a document that already reached `ready` or
+    `failed` can never be overwritten by a late status update (an
+    unexpected conflict is reported as no transition instead of being
+    silently "fixed" by a second transition). The failure fields are
+    cleared on `ready`, which the Phase 5.7 schema check constraint
+    (`documents_failure_fields_only_when_failed`) requires — a `ready`
+    document must never carry residual failure information.
+
+    `updated_at` is set explicitly because no trigger maintains it.
+
+    Returns the updated document row (exactly one row transitioned
+    from `processing`), or `None` when zero rows transitioned — the
+    caller must then treat the outcome as conflict/failure and never
+    claim `ready` was persisted.
+    """
+
+    await cursor.execute(
+        f"""
+        UPDATE public.documents
+        SET
+            status = 'ready',
+            failure_stage = NULL,
+            failure_message = NULL,
+            updated_at = now()
+        WHERE id = %s AND status = 'processing'
+        RETURNING {_DOCUMENT_COLUMNS}
+        """,
+        [document_id],
+    )
+
+    return await _fetch_updated_row(cursor)
+
+
+async def mark_document_failed(
+    cursor: AsyncCursor,
+    *,
+    document_id: uuid.UUID,
+    stage: str,
+    message: str,
+) -> dict | None:
+    """Transition one document from `processing` to `failed`.
+
+    `stage` and `message` are sanitized, application-controlled
+    values (a controlled failure-stage slug and a static message —
+    never uncontrolled exception text, storage paths, credentials,
+    or document contents). They are bound as parameters; the Phase
+    5.7 check constraint requires exactly this pair on a `failed`
+    document that records failure information.
+
+    The same `status = 'processing'` guard applies: zero updated rows
+    means the document is no longer `processing` (conflict), and the
+    caller must treat that as a persistence failure rather than
+    claiming `failed` was recorded.
+    """
+
+    await cursor.execute(
+        f"""
+        UPDATE public.documents
+        SET
+            status = 'failed',
+            failure_stage = %s,
+            failure_message = %s,
+            updated_at = now()
+        WHERE id = %s AND status = 'processing'
+        RETURNING {_DOCUMENT_COLUMNS}
+        """,
+        [stage, message, document_id],
+    )
+
+    return await _fetch_updated_row(cursor)
+
+
+async def delete_document(
+    cursor: AsyncCursor,
+    *,
+    document_id: uuid.UUID,
+) -> str | None:
+    """Delete one document row and return its internal storage_path.
+
+    The ``RETURNING`` clause yields the row's storage_path in the same
+    statement that deletes it. Zero fetched rows means the document id
+    does not exist: the caller must report not-found and must not
+    attempt any Storage removal, since the object path is only ever
+    known from the row.
+
+    The document's chunk rows are removed by the schema's existing
+    foreign key (``document_chunks.document_id references
+    documents(id) on delete cascade`` from the initial schema) as part
+    of this same statement. No separate chunk deletion is performed,
+    and this file therefore contains no chunk-deletion statement for
+    deletion purposes.
+
+    The storage_path is an internal value: it is used only to address
+    the Storage object, never logged, and never returned to callers
+    above the service layer or placed in responses.
+
+    Parameterized SQL. Commit semantics follow the repository
+    convention in this module: the statement runs on the caller's
+    cursor/transaction, and the caller (service) commits.
+
+    Returns the deleted row's storage_path, or ``None`` when no row
+    matched ``document_id``.
+    """
+    await cursor.execute(
+        """
+        DELETE FROM public.documents
+        WHERE id = %s
+        RETURNING storage_path
+        """,
+        [document_id],
+    )
+
+    row = await cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return row[0]
+
+
+async def _fetch_updated_row(cursor: AsyncCursor) -> dict | None:
+    """Return the single RETURNING row, or None for a zero-row update."""
+
+    row = await cursor.fetchone()
+
+    if row is None:
+        return None
+
+    column_names = [column.name for column in cursor.description]
+
+    return dict(zip(column_names, row, strict=True))

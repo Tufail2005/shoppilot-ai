@@ -1,13 +1,19 @@
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from psycopg_pool import AsyncConnectionPool
-from supabase import Client
+from storage3 import SyncStorageClient
 
 from app.auth import require_role
 from app.db import get_db
-from app.schemas.documents import DocumentOut, DocumentVisibility
+from app.schemas.documents import (
+    DocumentOut,
+    DocumentVisibility,
+    DocumentVisibilityUpdate,
+)
 from app.services import documents as documents_service
+from app.services.embeddings import EmbeddingProvider, get_embedding_provider
 from app.storage import get_storage
 
 
@@ -29,7 +35,11 @@ async def upload_document(
     ],
     file: Annotated[UploadFile, File()],
     pool: Annotated[AsyncConnectionPool, Depends(get_db)],
-    storage: Annotated[Client, Depends(get_storage)],
+    storage: Annotated[SyncStorageClient, Depends(get_storage)],
+    embedding_provider: Annotated[
+        EmbeddingProvider,
+        Depends(get_embedding_provider),
+    ],
     visibility: Annotated[
         DocumentVisibility | None,
         Form(),
@@ -42,6 +52,55 @@ async def upload_document(
             user_role=current_user["role"],
             upload=file,
             visibility=visibility,
+            embedding_provider=embedding_provider,
         )
     finally:
         await file.close()
+
+
+@router.delete(
+    "/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_document(
+    document_id: uuid.UUID,
+    current_user: Annotated[
+        dict,
+        Depends(require_role("admin")),
+    ],
+    pool: Annotated[AsyncConnectionPool, Depends(get_db)],
+    storage: Annotated[SyncStorageClient, Depends(get_storage)],
+):
+    # Admin-only: deletion is destructive and irreversible, and the
+    # documents table has no creator column to scope a support agent's
+    # deletion right to their own uploads.
+    await documents_service.delete_document(
+        pool,
+        storage,
+        document_id=document_id,
+    )
+
+
+@router.patch(
+    "/documents/{document_id}",
+    response_model=DocumentOut,
+)
+async def update_document_visibility(
+    document_id: uuid.UUID,
+    payload: DocumentVisibilityUpdate,
+    current_user: Annotated[
+        dict,
+        Depends(require_role("admin")),
+    ],
+    pool: Annotated[AsyncConnectionPool, Depends(get_db)],
+):
+    # Admin-only. Flipping `internal -> public` is a content-exposure
+    # grant, and the documents table has no creator column to scope a
+    # support agent's update right to their own uploads (the same
+    # rationale as the admin-only deletion in Phase 5.8). Changing
+    # visibility never touches Storage, chunks, or embeddings.
+    return await documents_service.update_document_visibility(
+        pool,
+        document_id=document_id,
+        visibility=payload.visibility,
+    )

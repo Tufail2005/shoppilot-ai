@@ -7,11 +7,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.repositories import documents as documents_repository
+from app.services.embeddings import get_embedding_provider
 from app.storage import get_storage
+from tests.ingestion_fakes import FakeEmbeddingProvider
+from tests.test_documents_units import _build_pdf
 
 
 # 20 MiB = 20,971,520 bytes
 MAX_DOCUMENT_SIZE = 20 * 1024 * 1024
+
+# The upload route now runs the real ingestion pipeline, so success
+# paths need an actually parseable, text-bearing PDF (built in-memory
+# by the Phase 5.3 fixture builder).
+_INGESTABLE_PDF = _build_pdf(["minimal return policy page one"])
 
 _VALID_PDF = b"%PDF-1.4\nminimal test document content"
 _STORAGE_PATH_PATTERN = re.compile(
@@ -42,6 +50,20 @@ class FakeStorageBucket:
             }
         )
 
+    def download(self, path: str) -> bytes:
+        """Serve the ingestion pipeline's download like the real bucket."""
+
+        self._state.downloads.append(path)
+
+        if self._state.fail_download:
+            raise RuntimeError("simulated storage outage")
+
+        for upload in self._state.uploads:
+            if upload["path"] == path:
+                return upload["data"]
+
+        raise RuntimeError("simulated missing Storage object")
+
     def remove(self, paths: list[str]) -> None:
         self._state.removes.extend(paths)
 
@@ -51,10 +73,13 @@ class FakeStorageState:
         self,
         *,
         fail_upload: bool = False,
+        fail_download: bool = False,
     ):
         self.fail_upload = fail_upload
+        self.fail_download = fail_download
         self.uploads: list[dict] = []
         self.removes: list[str] = []
+        self.downloads: list[str] = []
 
 
 class FakeStorageClient:
@@ -68,10 +93,24 @@ class FakeStorageClient:
 
 def _install_fake_storage(
     state: FakeStorageState,
-) -> None:
+    *,
+    provider: FakeEmbeddingProvider | None = None,
+) -> FakeEmbeddingProvider:
+    """Override Storage and the embedding provider for the request.
+
+    The upload route resolves the embedding provider BEFORE the upload
+    runs, so every request exercise must inject a fake — the real
+    dependency would construct a live Gemini client from GEMINI_API_KEY
+    when configured, and tests must never reach the network.
+    """
     from app.main import app
 
+    fake_provider = provider if provider is not None else FakeEmbeddingProvider()
+
     app.dependency_overrides[get_storage] = lambda: FakeStorageClient(state)
+    app.dependency_overrides[get_embedding_provider] = lambda: fake_provider
+
+    return fake_provider
 
 
 _DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -85,7 +124,8 @@ def _fetch_document(doc_id: str) -> dict | None:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT title, visibility, status, storage_path, version
+                SELECT title, visibility, status, storage_path, version,
+                       failure_stage, failure_message
                 FROM public.documents
                 WHERE id = %s
                 """,
@@ -103,7 +143,62 @@ def _fetch_document(doc_id: str) -> dict | None:
         "status": row[2],
         "storage_path": row[3],
         "version": row[4],
+        "failure_stage": row[5],
+        "failure_message": row[6],
     }
+
+
+def _count_chunks(doc_id: str) -> int:
+    with psycopg.Connection.connect(
+        _DATABASE_URL,
+        connect_timeout=5,
+    ) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT count(*)
+                FROM public.document_chunks
+                WHERE document_id = %s
+                """,
+                (doc_id,),
+            )
+
+            return cursor.fetchone()[0]
+
+
+def _document_id_by_storage_path(storage_path: str) -> str | None:
+    with psycopg.Connection.connect(
+        _DATABASE_URL,
+        connect_timeout=5,
+    ) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM public.documents
+                WHERE storage_path = %s
+                """,
+                (storage_path,),
+            )
+
+            row = cursor.fetchone()
+
+    return str(row[0]) if row is not None else None
+
+
+def _delete_by_state(state: "FakeStorageState") -> None:
+    """Clean up the request's document row via its Storage object path.
+
+    Used by tests whose response does not carry the document id
+    (sanitized 50x error responses).
+    """
+    if not state.uploads:
+        return
+
+    document_id = _document_id_by_storage_path(state.uploads[0]["path"])
+
+    if document_id is not None:
+        _delete_document(document_id)
 
 
 def _document_exists(doc_id: str) -> bool:
@@ -151,30 +246,41 @@ class TestSuccessfulUpload:
 
         response = agent_client.post(
             "/admin/documents",
-            files={"file": ("Return Policy.pdf", _VALID_PDF, "application/pdf")},
+            files={"file": ("Return Policy.pdf", _INGESTABLE_PDF, "application/pdf")},
         )
 
         assert response.status_code == 201
 
         document = response.json()
         assert document["title"] == "Return Policy"
-        assert document["status"] == "processing"
+        # The route runs the ingestion pipeline synchronously, so the
+        # response reports the document's final, fully ingested state.
+        assert document["status"] == "ready"
+        assert document["failure_stage"] is None
+        assert document["failure_message"] is None
         assert document["visibility"] == "internal"
         assert document["version"] == 1
         assert "storage_path" not in document
 
-        # Storage received the real PDF bytes with PDF content type.
+        # Storage received the real PDF bytes with PDF content type
+        # and the ingestion pipeline downloaded them back.
         assert len(state.uploads) == 1
         upload = state.uploads[0]
-        assert upload["data"] == _VALID_PDF
+        assert upload["data"] == _INGESTABLE_PDF
         assert upload["content_type"] == "application/pdf"
+        assert state.downloads == [upload["path"]]
 
         row = _fetch_document(document["id"])
         assert row is not None
-        assert row["status"] == "processing"
+        assert row["status"] == "ready"
         assert row["visibility"] == "internal"
         assert row["version"] == 1
         assert row["storage_path"] == upload["path"]
+        assert row["failure_stage"] is None
+        assert row["failure_message"] is None
+
+        # Chunks were really inserted by the pipeline.
+        assert _count_chunks(document["id"]) > 0
 
         _delete_document(document["id"])
 
@@ -184,7 +290,7 @@ class TestSuccessfulUpload:
 
         response = admin_client.post(
             "/admin/documents",
-            files={"file": ("Ops Handbook.pdf", _VALID_PDF, "application/pdf")},
+            files={"file": ("Ops Handbook.pdf", _INGESTABLE_PDF, "application/pdf")},
         )
 
         assert response.status_code == 201
@@ -192,7 +298,7 @@ class TestSuccessfulUpload:
         document = response.json()
         row = _fetch_document(document["id"])
         assert row is not None
-        assert row["status"] == "processing"
+        assert row["status"] == "ready"
         assert row["visibility"] == "internal"
 
         _delete_document(document["id"])
@@ -203,7 +309,7 @@ class TestSuccessfulUpload:
 
         response = admin_client.post(
             "/admin/documents",
-            files={"file": ("doc.pdf", _VALID_PDF, "application/pdf")},
+            files={"file": ("doc.pdf", _INGESTABLE_PDF, "application/pdf")},
             data={"visibility": "public"},
         )
 
@@ -213,7 +319,7 @@ class TestSuccessfulUpload:
         row = _fetch_document(document["id"])
         assert row is not None
         assert row["visibility"] == "public"
-        assert row["status"] == "processing"
+        assert row["status"] == "ready"
 
         _delete_document(document["id"])
 
@@ -302,9 +408,19 @@ class TestContentValidation:
             files={"file": ("exact.pdf", exact_size_pdf, "application/pdf")},
         )
 
+        # The size boundary still accepts the upload and creates the
+        # row. This content is not a parseable PDF, so the ingestion
+        # outcome is orthogonal here: the final state of the created
+        # document is whatever ingestion recorded (contract tested in
+        # tests/test_admin_documents_ingestion.py). Only boundary
+        # acceptance is asserted.
         assert response.status_code == 201
 
         document = response.json()
+
+        row = _fetch_document(document["id"])
+        assert row is not None
+
         _delete_document(document["id"])
 
 
@@ -383,7 +499,7 @@ class TestStoredObjectPath:
 
         response = admin_client.post(
             "/admin/documents",
-            files={"file": (hostile_filename, _VALID_PDF, "application/pdf")},
+            files={"file": (hostile_filename, _INGESTABLE_PDF, "application/pdf")},
         )
 
         assert response.status_code == 201
@@ -399,6 +515,7 @@ class TestStoredObjectPath:
         row = _fetch_document(document["id"])
         assert row is not None
         assert row["storage_path"] == upload["path"]
+        assert row["status"] == "ready"
 
         _delete_document(document["id"])
 
@@ -411,7 +528,7 @@ class TestStoredObjectPath:
 
         response = admin_client.post(
             "/admin/documents",
-            files={"file": ("Confidential Ops Handbook v2.pdf", _VALID_PDF, "application/pdf")},
+            files={"file": ("Confidential Ops Handbook v2.pdf", _INGESTABLE_PDF, "application/pdf")},
         )
 
         assert response.status_code == 201
@@ -425,7 +542,7 @@ class TestStoredObjectPath:
 
         response = admin_client.post(
             "/admin/documents",
-            files={"file": ("   .pdf", _VALID_PDF, "application/pdf")},
+            files={"file": ("   .pdf", _INGESTABLE_PDF, "application/pdf")},
         )
 
         assert response.status_code == 201
