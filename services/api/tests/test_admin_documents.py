@@ -629,7 +629,7 @@ class TestFailureLogging:
 
         # The log records identify the failing stage and exception
         # type instead of uncontrolled error text.
-        assert "Storage upload failed: RuntimeError" in messages
+        assert "Storage upload failed: type=RuntimeError status=None code=None" in messages
         assert (
             "Failed to register document after Storage upload: RuntimeError"
             in messages

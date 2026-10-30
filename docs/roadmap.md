@@ -115,12 +115,19 @@ Completed:
 
 - phase 5.10 — End-to-end knowledge-base acceptance run with two synthetic PDFs against the REAL local Supabase stack and the REAL Gemini provider: new opt-in module `tests/test_kb_lifecycle_acceptance.py` + in-memory fixture builder `tests/kb_acceptance_pdfs.py` (deterministic raw-PDF-1.4 primitives reusing the test_documents_units `_build_pdf` technique; 'Public Return Policy' uploaded public by admin and 'Internal Operations Handbook' uploaded internal by support agent — both generated in memory only, never written to disk, each with a unique marker token (XQ71 / ZM584) and import-time self-validation: extraction succeeds, markers survive chunking, multiple chunks per document (4 public / 3 internal)); `get_embedding_provider` deliberately left un-overridden so each upload makes live gemini-embedding-2 API calls (the module skips — live run pending, never faked — when local Storage is unreachable or GEMINI_API_KEY is unconfigured; a configured-but-failing API surfaces as a `failed` document whose failure_stage appears explicitly in the failing assertion); `get_storage` overridden with the REAL local Storage service facade (documented demo service-role JWT, same precedent as the Phase 5.8 removal-policy tests); both documents verified `ready` via the real endpoint and direct SQL; chunks verified with contiguous indices, content containing the document marker, non-null `vector_dims(embedding) = 768`, and per-chunk DISTINCT non-zero embeddings (an aggregated one-embedding-for-the-document response would collapse into a failure); Storage objects verified byte-for-byte by download from the private bucket plus a public-URL non-servability check (bucket `public = false`); RLS matrix verified with `set local role authenticated` + simulated `request.jwt.claims` JWTs (the Phase 3.10 technique; the app's service-role pool cannot verify RLS): customer sees ONLY the public document and its chunks, agent/admin also see the internal document and chunks, anon sees nothing (empty result — the local CLI auto-grants SELECT to anon and the denial is purely RLS because no anon policy exists, not a privilege error); PATCH visibility internal↔public flips customer access in both directions immediately (read-time policy evaluation; visibility restored even on mid-test failure); hygiene assertions: DocumentOut responses carry no storage_path or document markers, a rejected agent public-upload returns the sanitized 403 and creates no row, and app log records (caplog, app loggers only — SDK debug URL logging explicitly out of scope) contain no storage path, no 'uploads/', no document text, and no embedding-text prefix; cleanup executes even when assertions fail and deletes ONLY the two + one log-check documents created by this run through the real DELETE endpoint (404-tolerant, with direct Storage remove + DB DELETE fallback), then asserts zero residue for rows, cascaded chunks, and Storage objects; results: 17/17 acceptance tests passed live (real Storage + real Postgres + real Gemini), full backend suite 265 passed / 0 failed (Phase 5.9 baseline 248 + 17), pre-run and post-run database/Storage state identical except this run's own documents removed; limitations documented: local-stack-only (no cloud), text-layer PDFs only (pypdf does no OCR), and per-instance retention of visibility semantics unchanged from Phase 5.9;
 
-# Current target:
-
-phase 6 — RAG (starts with 6.1 retrieve(query, user_role, top_k=5))
+- phase 6.1 — services/retrieval.py `retrieve(pool, embedding_provider, *, query, user_role) -> list[dict]`: the query is embedded through the existing Phase 5.5 provider's `embed_query` (the asymmetric query-side method the provider module mandates for compatibility with `embed_documents` vectors) offloaded via `asyncio.to_thread` (no event-loop blocking), the returned vector re-validated to exactly one 768-finite-non-bool-float vector (mirroring the ingestion-side validation) before any SQL; the trusted role → visibility map lives server-side only (`customer` → public, `support_agent`/`admin` → public+internal) with an unsupported/missing role failing closed via RetrievalError(stage='role_validation') BEFORE the embedding call and SQL — never any client-supplied role; repositories/retrieval.py `retrieve_chunks` runs ONE parameterized statement (no interpolation: the role-derived visibility list is bound as a text array via `d.visibility::text = ANY(%s)` and the validated query embedding renders through the SHARED `_vector_literal` helper from repositories/documents.py, bound twice with the same `%s::extensions.vector` cast ingestion uses — no new serialization format) joining document_chunks→documents with `WHERE d.status = 'ready'` (processing/failed never retrievable), cosine distance ordering `ORDER BY c.embedding <=> %s::extensions.vector ASC` consistent with the existing ivfflat vector_cosine_ops index, deterministic tie-breakers `d.id, c.chunk_index`, and a FIXED server-side `LIMIT 5` (RETRIEVAL_LIMIT constant — no `top_k` exists anywhere; deliberate deviation from the roadmap's `top_k=5` signature, which would have been client-controllable); no similarity threshold (Phase 15 owns calibration — zero results is returned as [] and is never interpreted as "no relevant documents"); results carry citation-ready fields only (chunk id, document_id, title, visibility, chunk_index, content, distance) and the entity never returns the embedding; provider failures keep the established types (`EmbeddingError`/`TypeError`/`ValueError` propagate unchanged) while database failures normalize to RetrievalError(stage='database_query') with the original chained — a DB failure can never masquerade as an empty result; logging never includes query text, vectors, or raw error messages; NO router/schema/seed/migration changes (the schema needed nothing and `POST /rag/query` is Phase 6.4) — no configuration, pool, or provider duplication; tests: 26 offline unit tests (fake cursor/pool/provider asserting the SQL contract: ready filter, ANY visibility binding, LIMIT 5, cosine+tie-break ordering, parameter binding of the query literal, request text never interpolated, fail-closed roles, embedding validation gates, empty→[], DB failure→RetrievalError) + 12 real-DB integration tests against local Supabase (real pool, real `<=>`, real vector(768) column; crafted 768-dim vectors give exact cosine geometry — distance-0 twin vs orthogonal — NOT semantic claims; customer-must-not-see-internal even on a perfect distance-0 match, staff matrix, processing/failed exclusion, ≤5 with 6 available, exact expected order incl. tie-breakers, citation-ready fields, empty-visibility→[], unsupported role fails closed on the live pool, and a 767-dim query embedding rejected by pgvector as the 768 contract proof); 38/38 retrieval tests pass; no Gemini network call in any test (provider injected) and semantic relevance is explicitly Phase 15 evaluation work
 
 
-# Next target:
+- phase 6.2 — app/services/rag_prompt.py: provider-neutral RAG prompt builder `build_rag_prompt(query, chunks) -> RagPrompt` — a pure module (no Gemini SDK/imports, no DB, no I/O, no logging) over the Phase 6.1 retrieval shape (id, document_id, title, visibility, chunk_index, content, distance; visibility/distance deliberately ignored for prompt text); a static SYSTEM_INSTRUCTION constant enforces grounded answers from ONLY the supplied retrieved sources, frames every chunk's content/titles/metadata as untrusted reference data (never instructions), forbids obeying embedded override attempts (role changes, secret reveals, rule ignoring), forbids inventing facts/policies/citations/sources, mandates `[1], [2], [3]`-style citations, and embeds the exact insufficient-evidence wording via the exposed `INSUFFICIENT_EVIDENCE_MESSAGE = "I don't have enough information."` constant (single source of truth Phase 6.3 can reuse); every chunk receives a deterministic request-local numbered reference — reference n labels the chunk at retrieval position n (the Phase 6.1 cosine+tie-breaker order is already deterministic), numbers are builder-assigned so document text can never forge/renumber them, and the frozen `SourceReference(number, chunk_id, document_id, document_title, chunk_index, content)` list on `RagPrompt.sources` is the explicit number→chunk mapping for Phase 6.3 citation validation and the response citation list; question (`RagPrompt.question`) and rendered sources (`RagPrompt.sources_text`) are separate addressable fields — never embedded in each other — with each source block labeled `[n]` + title/document id/chunk id/chunk index and content rendered verbatim inside per-source builder-numbered `<source n>...</source n>` tags (structural aid declared in the module docstring as NOT a complete injection defense — Phase 14 owns filtering/sanitization; defense-in-depth for this step = the instruction layer + Phase 6.1 server-side authorization that decides which chunks exist); empty chunk list renders an explicit "No retrieved sources." section and empty chunk content renders an empty data block — nothing fabricated in either case; static-message TypeError/ValueError validation mirrors app/services/embeddings.py (non-string/whitespace query, non-sequence/non-mapping chunks, missing required fields, non-string title/content); output is a frozen value dataclass a GenAI adapter maps to system-instruction + single user turn without SDK coupling; tests: 38 offline unit tests with synthetic retrieval-shaped chunks (sequential references, position-independent numbering, mapping round-trips, metadata rendering, question/source separation, hostile content — injected `[99]`/"ignore previous instructions"/closing-tag imposters preserve the mapping and open-tag uniqueness, repeatability equality, static validation); 76/76 Phase 6.2 + 6.1 unit and integration tests pass (38 prompt + 26 retrieval unit + 12 retrieval integration); full backend suite 340 passed / 1 pre-existing unrelated failure (test_admin_documents failure-log-format assertion, untouched by this step); no generation adapter, no endpoint, no thresholds, no schema changes
+
+- phase 6.3 — app/services/generation.py: Gemini RAG generation adapter + citation validation on the SAME google-genai SDK dependency as Phase 5.5 (>=2.33.0, no new dependency); generation surface is the CURRENT docs-recommended Interactions API `client.interactions.create(...)` (verified live against ai.google.dev text-generation docs and the installed SDK: `models.generate_content` is the legacy surface being migrated to Interactions) with `model` + `system_instruction=prompt.system_instruction` + `input=[TextContent(question), TextContent(sources_text)]` (question and rendered sources as two DISTINCT text parts — never merged) and STATELESS generation mandatory via `store=False` (no server-side conversation state is created or relied on; conversation/memory layers deliberately NOT added, Phase 7/9 own them); response treated as untrusted in its actual Interactions contract — status must be exactly 'completed' (failed/cancelled/incomplete/budget_exceeded/queued/requires_action/in_progress all fail) and aggregated `output_text` must be a non-empty non-whitespace string, otherwise GenerationError; `GenerationError(message, *, stage)` with static messages (never query/source/generated text/keys) and original causes chained, stages: configuration | generation_request | empty_response | unsuccessful_response | empty_output | no_sources; GENERATION model is configurable via the new Settings field `gemini_generation_model` (default `gemini-3.8-flash` — verified stable against ai.google.dev/gemini-api/docs/models 2026-10; recorded deviation: the roadmap's literal 6.3 text named `gemini-2.0-flash`, which the model list now marks Shut down), key from the existing `GEMINI_API_KEY` SecretStr convention, lazy factory `create_gemini_generation_provider` (no client/credential at import time, missing key → clear GEMINI_API_KEY GenerationError; model never hardcoded in code); `validate_citations(answer_text, sources)` is pure + offline: regex-scans the Phase 6.2 `[n]` syntax and resolves ONLY against `RagPrompt.sources` (never model-invented ids), dedupes repeated references keeping FIRST-APPEARANCE order, copies number/chunk_id/document_id/document_title/chunk_index unchanged from the matched SourceReference; explicit safe behavior: out-of-range/zero/unknown references are EXCLUDED from the citation list (an invalid reference can never produce a citation object for a chunk that was not retrieved) while the answer text is returned UNTOUCHED — recorded limitation for Phase 14.7 (broader output validation + strict citation-prose enforcement) with the explicit distinction that a syntactically valid citation list proves usage of the numbering convention, NOT factual grounding (Phase 15 eval); frozen `RagAnswer(answer, citations)` + tiny `Citation` dataclass; async orchestrator `generate_rag_answer(pool, embedding_provider, generation_provider, *, query, user_role) -> RagAnswer` as the single reusable Phase 6.4 seam: trusted-role retrieval → build_rag_prompt → EMPTY-RETRIEVAL SHORT-CIRCUIT returning exactly INSUFFICIENT_EVIDENCE_MESSAGE ("I don't have enough information.") with NO citations and NO model call (no similarity thresholds, Phase 15 owns calibration) → sync provider call offloaded via asyncio.to_thread (no event-loop blocking) → validate_citations; provider-adapter guard: a prompt with zero sources fails GenerationError(no_sources) BEFORE any API call so empty retrieval can never reach the model even if the orchestrator is bypassed; EmbeddingError/RetrievalError/GenerationError/prompt ValueError/TypeError propagate unchanged; type-only logging of failures and citation counts (never key/text/vector/output content); tests: 46 fully offline unit tests with a fake Interactions client recording requests and replaying canned Interaction-shaped responses (asserts `store=False` is passed, system_instruction passthrough, distinct question/sources inputs, configured model name, no-sources guard with zero API calls, every non-completed status, missing/blank/non-string output_text, chained provider exception causes with static sanitized messages, citation mapping/dedup-order/out-of-range/zero/unknown/mixed-empty cases, citation metadata provenance and no-fabrication for unretrieved chunks, missing/empty key factory errors + model-misconfiguration, orchestrator short-circuit with NO generate call + exact wording, and Phase 6.1/6.2 contracts unchanged); Phase 6.1+6.2 regression: 38 prompt + 26 retrieval unit + 12 retrieval integration = 76 passed; full backend suite 386 passed with the sole pre-existing unrelated failure test_admin_documents.py::TestFailureLogging::test_failure_logs_do_not_expose_internal_storage_paths (untouched by design this phase)
+
+## Current target:
+
+phase 6 — RAG (continues with 6.4 POST /rag/query endpoint)
+
+
+## Next target:
 
 phase 7 — Customer Chat
 
@@ -129,8 +136,9 @@ phase 7 — Customer Chat
 
 1.1 Create empty GitHub repo shoppilot-ai (no README init to avoid conflicts)
 
-1.2 Clone locally, create folder structure:
+1.2 Clone locally, create folder structure:
 
+```
 shoppilot-ai/
 
 ├── apps/web/
@@ -142,9 +150,9 @@ shoppilot-ai/
 ├── .gitignore
 
 └── README.md
+```
 
-
-1.3 Create Next.js app: npx create-next-app@latest apps/web --typescript --tailwind --app
+1.3 Create Next.js app: npx create-next-app@latest apps/web --typescript --tailwind --app
 
 1.4 Create FastAPI service with uv: uv init services/api → add fastapi, uvicorn, pydantic-settings
 
@@ -207,8 +215,9 @@ order_items (id, order_id, product_id, quantity, price)
 
 tickets (id, customer_id, order_id, subject, status, priority, assigned_to)
 
+```
 
-2.3 Write migration for knowledge tables:
+2.3 Write migration for knowledge tables:
 
 
 documents (id, title, storage_path, visibility [public|internal], status, version)
@@ -244,6 +253,8 @@ audit_logs (id, actor_id, action, resource, metadata)
 
 2.10 Add RLS policies (draft) — full enforcement comes in Phase 3
 
+---
+
 ## Phase 3 — Auth + RBAC
 
 3.1 Install @supabase/supabase-js + @supabase/ssr in Next.js
@@ -270,7 +281,9 @@ audit_logs (id, actor_id, action, resource, metadata)
 
 - agents see all orders/tickets
 
-- documents: public for all, internal only for agents/admins3.11 Write test checklist: customer hitting agent endpoint = 403, anon hitting protected = 401 — verify each
+- documents: public for all, internal only for agents/admins
+
+3.11 Write test checklist: customer hitting agent endpoint = 403, anon hitting protected = 401 — verify each.
 
 ## Phase 4 — E-commerce Backend
 
@@ -322,9 +335,11 @@ audit_logs (id, actor_id, action, resource, metadata)
 
 - SELECT ... FROM document_chunks ORDER BY embedding <=> query_embedding LIMIT k
 
-- join to documents, filter by visibility based on role6.2 Write prompt template:
+- join to documents, filter by visibility based on role 
 
+6.2 Write prompt template:
 
+```
 Answer using only the context below. Cite sources as [1], [2].
 
 If context is insufficient, say "I don't have enough information."
@@ -332,7 +347,7 @@ If context is insufficient, say "I don't have enough information."
 Context: {chunks with ids}
 
 Question: {query}
-
+```
 
 6.3 Call Gemini (gemini-2.0-flash), return answer + citation list mapping [n] → chunk/document
 
@@ -508,7 +523,23 @@ get_order → check_return_policy → calculate_refund → decision
 
 - 10 multi-step workflow cases
 
-- 10 security attack cases15.2 RAG eval: run retrieval, measure hit-rate@5 and answer correctness (LLM-as-judge)15.3 Citation eval: verify cited docs exist in retrieved set, correct doc15.4 Intent eval: accuracy % of classification15.5 Tool eval: correct tool chosen, correct params15.6 Security eval: 100% block rate required15.7 HITL eval: escalation triggered when it should, resumed correctly15.8 Write run_evals.py → outputs markdown/JSON report with pass rates15.9 Add npm/uv script make eval for one-command runs
+- 10 security attack cases
+
+15.2 RAG eval: run retrieval, measure hit-rate@5 and answer correctness (LLM-as-judge)
+
+15.3 Citation eval: verify cited docs exist in retrieved set, correct doc
+
+15.4 Intent eval: accuracy % of classification
+
+15.5 Tool eval: correct tool chosen, correct params
+
+15.6 Security eval: 100% block rate required
+
+15.7 HITL eval: escalation triggered when it should, resumed correctly
+
+15.8 Write run_evals.py → outputs markdown/JSON report with pass rates
+
+15.9 Add npm/uv script make eval for one-command runs
 
 ## Phase 16 — Employee/Admin UI
 

@@ -15,6 +15,12 @@ class Settings(BaseSettings):
 
     gemini_api_key: SecretStr | None = None
 
+    # Phase 6.3: the RAG generation model. Verified stable against
+    # https://ai.google.dev/gemini-api/docs/models (2026-10); the roadmap's
+    # original gemini-2.0-flash default is shut down.
+    gemini_generation_model: str = "gemini-3.8-flash"
+    gemini_generation_model: str = "gemini-3.8-flash"
+
 
 #   This part is not needed bcoz im using supabase get_claims() authentication approach
 
