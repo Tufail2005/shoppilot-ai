@@ -44,18 +44,18 @@ non-200 response mapped by Phase 6.4) FAILS the run and is reported as
 a pipeline failure, separately from answer-quality failures. A
 provider outage is never reported as an answer defect, and vice versa.
 
-Generation HTTP-timeout hardening (test-only): the Phase 6.3 factory
-creates its Gemini client without an HTTP timeout, so a provider stall
-hangs the request — and with it the whole pytest process — forever.
-The acceptance run validates the production configuration through the
-real factory, but then constructs the SAME
-``GeminiGenerationProvider`` adapter with a bounded HTTP client
-(``_GENERATION_HTTP_TIMEOUT_MS``) so a stalled generation becomes a pipeline
-failure instead of an indefinite hang. The adapter, prompt building,
-citation validation, and settings are the production path unchanged;
-only the client timeout is hardened here. Embeddings keep the real,
-unoverridden dependency (they have been reliable throughout; a stall
-there remains accepted residual risk).
+Generation HTTP-timeout hardening: production (Phase 6.6) now applies
+per-request SDK HTTP timeouts through the provider factories, so a
+stalled provider call is bounded at the SDK level. As an independent
+test-side safeguard (belt and braces), the acceptance run ALSO bounds
+the generation HTTP client (``_GENERATION_HTTP_TIMEOUT_MS``) and
+constructs the SAME ``GeminiGenerationProvider`` adapter directly —
+without the factory's ``timeout_seconds`` — so the client-level bound
+applies and a stalled provider fails a case instead of hanging the
+pytest process. The adapter, prompt building, citation validation, and
+settings are the production path unchanged. Embeddings keep the real,
+unoverridden dependency, which production now bounds per request (the
+configured ``gemini_embedding_timeout_seconds``, 10s by default).
 
 Recorded evaluation dimensions (per case, separately):
 
@@ -149,9 +149,10 @@ _EXPECTED_DOCUMENTS = (
 _OPT_IN_ENV = "RAG_ACCEPTANCE"
 _EMBED_PROBE_TIMEOUT_S = 60.0
 _GENERATION_PROBE_TIMEOUT_S = 90.0
-# Test-only hardening (see module docstring): the production factory
-# leaves the HTTP client unbounded; the acceptance run bounds it so a
-# provider stall fails a case instead of hanging the pytest process.
+# Test-only client-level safeguard (see module docstring): production
+# bounds each call per request through the factory (Phase 6.6), and the
+# acceptance run additionally bounds the client here so a provider stall
+# fails a case instead of hanging the pytest process.
 # Unit note: the client-level ``HttpOptions.timeout`` is milliseconds.
 _GENERATION_HTTP_TIMEOUT_MS = 60_000
 
@@ -416,9 +417,9 @@ class _RecordingGenerationProvider:
         self._provider = provider
         self.prompts: list = []
 
-    def generate(self, prompt):
+    def generate(self, prompt, *, cancel_event=None):
         self.prompts.append(prompt)
-        return self._provider.generate(prompt)
+        return self._provider.generate(prompt, cancel_event=cancel_event)
 
 
 class _CaseRecord:

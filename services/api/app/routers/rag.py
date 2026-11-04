@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends
 from psycopg_pool import AsyncConnectionPool
 
 from app.auth import require_role
+from app.core.provider_concurrency import ProviderLimiters, get_provider_limiters
 from app.db import get_db
 from app.schemas.rag import RagCitationOut, RagQueryIn, RagQueryOut
 from app.services import rag as rag_service
@@ -47,6 +48,10 @@ async def query_knowledge_base(
         GenerationProvider,
         Depends(rag_service.get_generation_provider),
     ],
+    limiters: Annotated[
+        ProviderLimiters,
+        Depends(get_provider_limiters),
+    ],
 ):
     # The role comes exclusively from the server-side profiles lookup;
     # the request body has no influence on it (extra="forbid").
@@ -56,6 +61,7 @@ async def query_knowledge_base(
         generation_provider,
         query=payload.query,
         user_role=current_user["role"],
+        limiters=limiters,
     )
 
     return RagQueryOut(

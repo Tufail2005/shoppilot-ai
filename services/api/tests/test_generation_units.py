@@ -7,11 +7,14 @@ requests and replays canned responses. No live Gemini call is made.
 """
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from pydantic import SecretStr
 
+from app.core.provider_retry import ProviderCallAborted, RetryPolicy
 from app.services import generation as generation_module
 from app.services.generation import (
     Citation,
@@ -28,6 +31,12 @@ from app.services.rag_prompt import (
     SourceReference,
     build_rag_prompt,
 )
+
+
+# Sentinel distinguishing "timeout not passed" from an explicit None in
+# the fake interactions API, so tests can assert the Phase 6.6 rule that
+# the keyword is omitted entirely when no timeout is configured.
+_UNSET = object()
 
 
 _PROMPT_QUERY = "How do I return an order?"
@@ -75,13 +84,17 @@ class FakeInteractionsApi:
         self.response_factory = response_factory
         self.error = error
 
-    def create(self, *, model, input, system_instruction, store):
+    def create(self, *, model, input, system_instruction, store, timeout=_UNSET):
         request = {
             "model": model,
             "input": input,
             "system_instruction": system_instruction,
             "store": store,
         }
+
+        if timeout is not _UNSET:
+            request["timeout"] = timeout
+
         self.requests.append(request)
 
         if self.error is not None:
@@ -272,6 +285,84 @@ class TestUntrustedResponse:
 
 
 # ---------------------------------------------------------------------------
+# Provider timeouts (Phase 6.6)
+# ---------------------------------------------------------------------------
+
+
+class TestProviderTimeouts:
+    def test_configured_timeout_is_passed_in_seconds(self):
+        api = FakeInteractionsApi()
+        provider = GeminiGenerationProvider(
+            SimpleNamespace(interactions=api),
+            model="test-generation-model",
+            timeout_seconds=15.0,
+        )
+
+        provider.generate(_prompt())
+
+        assert api.requests[0]["timeout"] == 15.0
+
+    def test_timeout_keyword_is_omitted_when_unset(self):
+        api = FakeInteractionsApi()
+
+        _make_provider(api).generate(_prompt())
+
+        assert "timeout" not in api.requests[0]
+
+    def test_timeout_failure_raises_generation_error_with_timeout_stage(self):
+        original = httpx.ReadTimeout("stalled at https://internal.example/v1")
+        api = FakeInteractionsApi(error=original)
+        provider = _make_provider(api)
+
+        with pytest.raises(GenerationError) as raised:
+            provider.generate(_prompt())
+
+        assert raised.value.stage == "generation_timeout"
+        assert raised.value.__cause__ is original
+        assert "internal.example" not in str(raised.value)
+
+    def test_real_sdk_timeout_wrapper_maps_to_timeout_stage(self):
+        """The SDK's own client-timeout class is translated, not generic.
+
+        The SDK raises ``APITimeoutError`` (not a ``TimeoutError`` and
+        not an ``httpx`` class) around the underlying
+        ``httpx.ReadTimeout``; this is what a stalled production call
+        actually produces.
+        """
+        compat_errors = pytest.importorskip(
+            "google.genai._gaos.lib.compat_errors"
+        )
+        request = httpx.Request("POST", "https://example.invalid/v1")
+        original = compat_errors.APITimeoutError(request)
+        api = FakeInteractionsApi(error=original)
+        provider = _make_provider(api)
+
+        with pytest.raises(GenerationError) as raised:
+            provider.generate(_prompt())
+
+        assert raised.value.stage == "generation_timeout"
+        assert raised.value.__cause__ is original
+
+    def test_non_timeout_provider_error_keeps_request_stage(self):
+        api = FakeInteractionsApi(error=RuntimeError("simulated outage"))
+        provider = _make_provider(api)
+
+        with pytest.raises(GenerationError) as raised:
+            provider.generate(_prompt())
+
+        assert raised.value.stage == "generation_request"
+
+    @pytest.mark.parametrize("bad_timeout", [0, -1, float("nan"), float("inf")])
+    def test_invalid_constructor_timeout_is_rejected(self, bad_timeout):
+        with pytest.raises(ValueError):
+            GeminiGenerationProvider(
+                SimpleNamespace(interactions=FakeInteractionsApi()),
+                model="test-generation-model",
+                timeout_seconds=bad_timeout,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Citation validation
 # ---------------------------------------------------------------------------
 
@@ -381,7 +472,7 @@ class StubGenerationProvider:
         self.requests = []
         self._answer = answer
 
-    def generate(self, prompt):
+    def generate(self, prompt, *, cancel_event=None):
         self.requests.append(prompt)
         return self._answer
 
@@ -395,11 +486,11 @@ class StubEmbeddingProvider:
             else [[0.1 * i for i in range(768)]]
         )
 
-    def embed_query(self, texts):
+    def embed_query(self, texts, *, cancel_event=None):
         self.requests.append(list(texts))
         return list(self._vectors)
 
-    def embed_documents(self, texts):
+    def embed_documents(self, texts, *, cancel_event=None):
         raise AssertionError("unit test must not embed documents")
 
 
@@ -425,7 +516,9 @@ class TestGenerateRagAnswer:
         chunks = build_rag_prompt(_PROMPT_QUERY, _PROMPT_CHUNKS).sources
         chunk_dicts = _PROMPT_CHUNKS
 
-        async def fake_retrieve(pool, provider, *, query, user_role):
+        async def fake_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
             assert user_role == "customer"
             return chunk_dicts
 
@@ -456,7 +549,9 @@ class TestGenerateRagAnswer:
     def test_empty_retrieval_returns_exact_message_without_generation_call(
         self, monkeypatch
     ):
-        async def fake_retrieve(pool, provider, *, query, user_role):
+        async def fake_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
             return []
 
         monkeypatch.setattr(
@@ -480,7 +575,9 @@ class TestGenerateRagAnswer:
         assert generator.requests == []
 
     def test_empty_retrieval_message_wording_is_exact(self, monkeypatch):
-        async def fake_retrieve(pool, provider, *, query, user_role):
+        async def fake_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
             return []
 
         monkeypatch.setattr(
@@ -500,7 +597,9 @@ class TestGenerateRagAnswer:
         assert result.answer == "I don't have enough information."
 
     def test_retrieval_errors_propagate_unchanged(self, monkeypatch):
-        async def failing_retrieve(pool, provider, *, query, user_role):
+        async def failing_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
             raise GenerationError(
                 "The permitted chunks could not be retrieved",
                 stage="database_query",
@@ -525,7 +624,9 @@ class TestGenerateRagAnswer:
         assert generator.requests == []
 
     def test_generation_errors_propagate_unchanged(self, monkeypatch):
-        async def fake_retrieve(pool, provider, *, query, user_role):
+        async def fake_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
             return _PROMPT_CHUNKS
 
         monkeypatch.setattr(
@@ -533,7 +634,7 @@ class TestGenerateRagAnswer:
         )
 
         class FailingProvider:
-            def generate(self, prompt):
+            def generate(self, prompt, *, cancel_event=None):
                 raise GenerationError(
                     "The RAG answer could not be generated",
                     stage="generation_request",
@@ -556,8 +657,15 @@ class TestGenerateRagAnswer:
 # ---------------------------------------------------------------------------
 
 
-def _settings_with(key, model="gemini-3.8-flash"):
-    return SimpleNamespace(gemini_api_key=key, gemini_generation_model=model)
+def _settings_with(key, model="gemini-3.8-flash", timeout_seconds=30.0):
+    return SimpleNamespace(
+        gemini_api_key=key,
+        gemini_generation_model=model,
+        gemini_generation_timeout_seconds=timeout_seconds,
+        gemini_retry_max_attempts=2,
+        gemini_retry_initial_delay_seconds=0.25,
+        gemini_retry_window_seconds=3.0,
+    )
 
 
 class TestProviderFactory:
@@ -612,6 +720,87 @@ class TestProviderFactory:
         with pytest.raises(GenerationError, match="generation model"):
             create_gemini_generation_provider()
 
+    def test_configured_model_reaches_the_interactions_request(self, monkeypatch):
+        from google import genai
+
+        api = FakeInteractionsApi()
+
+        monkeypatch.setattr(
+            generation_module,
+            "get_settings",
+            lambda: _settings_with(
+                SecretStr("test-key"), model="gemini-configured-model"
+            ),
+        )
+        monkeypatch.setattr(
+            genai,
+            "Client",
+            lambda *, api_key: SimpleNamespace(interactions=api),
+        )
+
+        provider = create_gemini_generation_provider()
+        provider.generate(_prompt())
+
+        assert provider._model == "gemini-configured-model"
+        assert api.requests[0]["model"] == "gemini-configured-model"
+
+    def test_default_settings_model_reaches_the_interactions_request(
+        self, monkeypatch
+    ):
+        from google import genai
+
+        from app.core.config import Settings
+
+        # The Python default must survive the whole path to the request,
+        # so ignore any local override in the environment or .env file.
+        monkeypatch.delenv("GEMINI_GENERATION_MODEL", raising=False)
+        api = FakeInteractionsApi()
+        settings = Settings(
+            _env_file=None,
+            database_url="postgresql://postgres:postgres@127.0.0.1:54322/postgres",
+            supabase_url="http://127.0.0.1:54321",
+            supabase_service_role_key="test-key",
+            gemini_api_key="test-key",
+        )
+
+        monkeypatch.setattr(
+            generation_module, "get_settings", lambda: settings
+        )
+        monkeypatch.setattr(
+            genai,
+            "Client",
+            lambda *, api_key: SimpleNamespace(interactions=api),
+        )
+
+        provider = create_gemini_generation_provider()
+        provider.generate(_prompt())
+
+        assert api.requests[0]["model"] == "gemini-3.5-flash-lite"
+
+    def test_factory_injects_the_configured_timeout(self, monkeypatch):
+        from google import genai
+
+        api = FakeInteractionsApi()
+
+        def fake_client_factory(*, api_key):
+            return SimpleNamespace(interactions=api)
+
+        monkeypatch.setattr(
+            generation_module,
+            "get_settings",
+            lambda: _settings_with(
+                SecretStr("test-key"),
+                model="fake-model",
+                timeout_seconds=7.5,
+            ),
+        )
+        monkeypatch.setattr(genai, "Client", fake_client_factory)
+
+        provider = create_gemini_generation_provider()
+        provider.generate(_prompt())
+
+        assert api.requests[0]["timeout"] == 7.5
+
 
 # ---------------------------------------------------------------------------
 # Prompt integration
@@ -641,3 +830,196 @@ class TestRagPromptIntegration:
             assert isinstance(source, SourceReference)
             assert source.number == position
             assert source.citation == f"[{position}]"
+
+
+# ---------------------------------------------------------------------------
+# Bounded retries (Phase 6.7)
+# ---------------------------------------------------------------------------
+
+
+class SequencedInteractionsApi(FakeInteractionsApi):
+    """Fails with the given exceptions in order, then succeeds."""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.pending_errors = list(errors)
+
+    def create(
+        self, *, model, input, system_instruction, store, timeout=_UNSET
+    ):
+        if self.pending_errors:
+            error = self.pending_errors.pop(0)
+            request = {
+                "model": model,
+                "input": input,
+                "system_instruction": system_instruction,
+                "store": store,
+            }
+
+            if timeout is not _UNSET:
+                request["timeout"] = timeout
+
+            self.requests.append(request)
+            raise error
+
+        return super().create(
+            model=model,
+            input=input,
+            system_instruction=system_instruction,
+            store=store,
+            timeout=timeout,
+        )
+
+
+def _retrying_generation_provider(api, **overrides):
+    policy = {
+        "max_attempts": 3,
+        "initial_delay_seconds": 0.001,
+        "retry_window_seconds": 3.0,
+    }
+    policy.update(overrides)
+
+    return GeminiGenerationProvider(
+        SimpleNamespace(interactions=api),
+        model="test-generation-model",
+        retry_policy=RetryPolicy(**policy),
+    )
+
+
+def _transient_generation_error():
+    return httpx.ConnectError(
+        "boom", request=httpx.Request("POST", "https://example.invalid")
+    )
+
+
+class TestBoundedRetries:
+    def test_transient_failure_is_retried_then_succeeds(self):
+        api = SequencedInteractionsApi([_transient_generation_error()])
+        provider = _retrying_generation_provider(api)
+
+        answer = provider.generate(_prompt())
+
+        assert len(api.requests) == 2
+        assert answer
+
+    def test_exhausted_retries_keep_the_generation_request_stage(self):
+        api = FakeInteractionsApi(error=_transient_generation_error())
+        provider = _retrying_generation_provider(api, max_attempts=2)
+
+        with pytest.raises(GenerationError) as raised:
+            provider.generate(_prompt())
+
+        assert raised.value.stage == "generation_request"
+        assert len(api.requests) == 2
+
+    def test_timeout_is_never_retried(self):
+        compat_errors = pytest.importorskip(
+            "google.genai._gaos.lib.compat_errors"
+        )
+        timeout = compat_errors.APITimeoutError(
+            httpx.Request("POST", "https://example.invalid")
+        )
+        api = SequencedInteractionsApi([timeout])
+        provider = _retrying_generation_provider(api)
+
+        with pytest.raises(GenerationError) as raised:
+            provider.generate(_prompt())
+
+        assert raised.value.stage == "generation_timeout"
+        assert len(api.requests) == 1
+
+    def test_rate_limited_failure_reports_stage_and_hint(self):
+        compat_errors = pytest.importorskip(
+            "google.genai._gaos.lib.compat_errors"
+        )
+        response = httpx.Response(
+            429,
+            headers={"Retry-After": "9"},
+            request=httpx.Request("POST", "https://example.invalid"),
+        )
+        api = FakeInteractionsApi(
+            error=compat_errors.RateLimitError(
+                "simulated", response=response, body=None
+            )
+        )
+        provider = _retrying_generation_provider(api, max_attempts=1)
+
+        with pytest.raises(GenerationError) as raised:
+            provider.generate(_prompt())
+
+        assert raised.value.stage == "rate_limited"
+        assert raised.value.retry_after_seconds == 9.0
+        assert len(api.requests) == 1
+
+    def test_cancelled_before_the_first_attempt_makes_no_call(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        api = FakeInteractionsApi()
+        provider = _retrying_generation_provider(api)
+
+        with pytest.raises(ProviderCallAborted):
+            provider.generate(_prompt(), cancel_event=cancel_event)
+
+        assert api.requests == []
+
+    def test_cancellation_during_backoff_propagates_unwrapped(self):
+        cancel_event = threading.Event()
+        api = FakeInteractionsApi(error=_transient_generation_error())
+        original = api.create
+
+        def cancelling(**kwargs):
+            cancel_event.set()
+            return original(**kwargs)
+
+        api.create = cancelling
+        provider = _retrying_generation_provider(
+            api, initial_delay_seconds=0.3
+        )
+
+        with pytest.raises(ProviderCallAborted):
+            provider.generate(_prompt(), cancel_event=cancel_event)
+
+        assert len(api.requests) == 1
+
+    def test_default_direct_provider_makes_exactly_one_attempt(self):
+        api = FakeInteractionsApi(error=_transient_generation_error())
+        provider = _make_provider(api)
+
+        with pytest.raises(GenerationError):
+            provider.generate(_prompt())
+
+        assert len(api.requests) == 1
+
+    def test_factory_injects_the_configured_retry_policy(self, monkeypatch):
+        from google import genai
+
+        created = {}
+
+        class RecordingProvider(GeminiGenerationProvider):
+            def __init__(self, client, *, retry_policy=None, **kwargs):
+                created["retry_policy"] = retry_policy
+                super().__init__(client, retry_policy=retry_policy, **kwargs)
+
+        monkeypatch.setattr(
+            generation_module, "GeminiGenerationProvider", RecordingProvider
+        )
+        monkeypatch.setattr(
+            generation_module,
+            "get_settings",
+            lambda: _settings_with(SecretStr("test-key")),
+        )
+        monkeypatch.setattr(
+            genai,
+            "Client",
+            lambda *, api_key: SimpleNamespace(
+                interactions=FakeInteractionsApi()
+            ),
+        )
+
+        create_gemini_generation_provider()
+
+        assert created["retry_policy"] == RetryPolicy(
+            max_attempts=2,
+            initial_delay_seconds=0.25,
+            retry_window_seconds=3.0,
+        )

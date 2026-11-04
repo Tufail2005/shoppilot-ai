@@ -216,35 +216,3 @@ Docker Compose runs:
 Supabase local development is provided by the Supabase CLI.
 
 Do not introduce a second PostgreSQL container unless explicitly required.
-
-## Current Implementation State
-
-Completed:
-
-- Next.js foundation
-- FastAPI foundation
-- Supabase/PostgreSQL schema
-- seed data
-- Docker Compose for web + API
-- web → API health check
-
-Current next target:
-
-Phase 4.2:
-- GET /products
-- GET /products/{id}
-
-After Phase 4.2:
-
-Phase 3:
-- Auth + RBAC
-
-Then:
-
-Phase 4.3:
-- GET /orders
-
-Do not implement protected order endpoints before the required authentication, RBAC, ownership, and RLS work is complete.
-
-
-Do not implement later phases prematurely.

@@ -43,7 +43,7 @@ class StubEmbeddingProvider:
         self.fail = fail
         self.calls: list[list[str]] = []
 
-    def embed_query(self, texts) -> list[list[float]]:
+    def embed_query(self, texts, *, cancel_event=None) -> list[list[float]]:
         self.calls.append(list(texts))
 
         if self.fail:
@@ -54,7 +54,7 @@ class StubEmbeddingProvider:
 
         return [list(self.vector) for _ in texts]
 
-    def embed_documents(self, texts):
+    def embed_documents(self, texts, *, cancel_event=None):
         raise AssertionError("retrieval must only call embed_query")
 
 

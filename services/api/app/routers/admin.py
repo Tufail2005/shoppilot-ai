@@ -6,6 +6,7 @@ from psycopg_pool import AsyncConnectionPool
 from storage3 import SyncStorageClient
 
 from app.auth import require_role
+from app.core.provider_concurrency import ProviderLimiters, get_provider_limiters
 from app.db import get_db
 from app.schemas.documents import (
     DocumentOut,
@@ -40,6 +41,10 @@ async def upload_document(
         EmbeddingProvider,
         Depends(get_embedding_provider),
     ],
+    limiters: Annotated[
+        ProviderLimiters,
+        Depends(get_provider_limiters),
+    ],
     visibility: Annotated[
         DocumentVisibility | None,
         Form(),
@@ -53,6 +58,7 @@ async def upload_document(
             upload=file,
             visibility=visibility,
             embedding_provider=embedding_provider,
+            limiters=limiters,
         )
     finally:
         await file.close()

@@ -25,6 +25,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import auth as app_auth
+from app.core.provider_concurrency import (
+    ProviderLimiters,
+    get_provider_limiters,
+)
 from app.db import get_db
 from app.main import app
 from app.routers.rag import rag_access
@@ -88,7 +92,7 @@ class StubEmbeddingProvider:
         self.vectors_override = vectors_override
         self.error = error
 
-    def embed_query(self, texts) -> list[list[float]]:
+    def embed_query(self, texts, *, cancel_event=None) -> list[list[float]]:
         self.calls.append(list(texts))
 
         if self.error is not None:
@@ -99,7 +103,7 @@ class StubEmbeddingProvider:
 
         return [list(self.vector) for _ in texts]
 
-    def embed_documents(self, texts):
+    def embed_documents(self, texts, *, cancel_event=None):
         raise AssertionError("retrieval must only call embed_query")
 
 
@@ -111,7 +115,7 @@ class StubGenerationProvider:
         self.answer = answer
         self.error = error
 
-    def generate(self, prompt) -> str:
+    def generate(self, prompt, *, cancel_event=None) -> str:
         self.requests.append(prompt)
 
         if self.error is not None:
@@ -205,12 +209,23 @@ class RagHarness:
     def post(self, payload: dict, headers: dict | None = None):
         return self.client.post("/rag/query", json=payload, headers=headers)
 
+    def use_limiters(self, limiters) -> None:
+        """Install a specific Phase 6.7 provider-admission registry.
+
+        ``ProviderLimiters`` builds its semaphores lazily, so the object
+        is safe to construct on the test thread as long as it is only
+        ever *awaited* inside the app's event loop (which the TestClient
+        owns) — here nothing is awaited before the request runs.
+        """
+        app.dependency_overrides[get_provider_limiters] = lambda: limiters
+
 
 _OVERRIDDEN_KEYS = (
     rag_access,
     get_db,
     rag_service.get_query_embedding_provider,
     rag_service.get_generation_provider,
+    get_provider_limiters,
 )
 
 
@@ -622,6 +637,90 @@ class TestErrorMapping:
         assert "simulated prompt validation failure" not in response.text
 
 
+class TestOverallDeadline:
+    """Phase 6.6: the asyncio.timeout deadline and its 504 mapping."""
+
+    def test_deadline_expiry_returns_sanitized_504(
+        self, harness, monkeypatch, caplog
+    ):
+        async def slow_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
+            await asyncio.sleep(30)
+            return []
+
+        monkeypatch.setattr(
+            generation_module.retrieval_service, "retrieve", slow_retrieve
+        )
+        monkeypatch.setattr(
+            rag_service,
+            "get_settings",
+            lambda: SimpleNamespace(rag_request_deadline_seconds=0.05),
+        )
+
+        caplog.set_level(logging.ERROR)
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 504
+        assert response.json() == {
+            "detail": "The RAG request exceeded its time limit.",
+        }
+        assert rag_service.DETAIL_REQUEST_TIMEOUT == (
+            "The RAG request exceeded its time limit."
+        )
+        # No query contents or internal details leak into the response
+        # or the logs.
+        assert _QUERY not in response.text
+        assert _QUERY not in caplog.text
+
+    def test_inner_timeout_error_is_not_the_overall_deadline(
+        self, harness, monkeypatch
+    ):
+        async def inner_timeout_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
+            raise TimeoutError("inner provider timeout")
+
+        monkeypatch.setattr(
+            generation_module.retrieval_service,
+            "retrieve",
+            inner_timeout_retrieve,
+        )
+        # The configured deadline cannot expire here; the only
+        # TimeoutError is raised by the pipeline itself, so the request
+        # must NOT be reported as a 504 deadline expiry.
+        monkeypatch.setattr(
+            rag_service,
+            "get_settings",
+            lambda: SimpleNamespace(rag_request_deadline_seconds=60.0),
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": rag_service.DETAIL_GENERATION_UNAVAILABLE,
+        }
+        assert "inner provider timeout" not in response.text
+
+    def test_provider_timeout_stage_still_maps_to_503(self, harness):
+        # A provider-level timeout is already wrapped in a
+        # GenerationError, so it is a 503 dependency failure, never the
+        # 504 overall deadline.
+        harness.cursor.rows = [_row()]
+        harness.generation.error = GenerationError(
+            "The RAG answer could not be generated",
+            stage="generation_timeout",
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": rag_service.DETAIL_GENERATION_UNAVAILABLE,
+        }
+
+
 class TestServiceErrorMapping:
     """Direct :func:`answer_query` mapping for the reachable retrieval stages."""
 
@@ -724,3 +823,162 @@ class TestProviderConfiguration:
             provider.generate(build_rag_prompt(_QUERY, [_chunk_dict()]))
 
         assert exc.value.stage == "configuration"
+
+
+# ---------------------------------------------------------------------------
+# Provider admission and rate limiting (Phase 6.7)
+# ---------------------------------------------------------------------------
+
+
+def _saturated_limiters(**overrides) -> ProviderLimiters:
+    """A registry whose resources can never be acquired.
+
+    ``BoundedSemaphore(0)`` is a legitimate "always at capacity" device:
+    ``locked()`` is true, every acquisition waits, and nothing is ever
+    released, so no cross-thread pre-acquisition (which would bind the
+    semaphore to the test loop) is needed.
+    """
+    base = {
+        "embedding_limit": 4,
+        "generation_limit": 2,
+        "rag_wait_seconds": 0.05,
+        "ingestion_wait_seconds": 0.05,
+    }
+    base.update(overrides)
+    return ProviderLimiters(**base)
+
+
+class TestAdmissionMapping:
+    """Phase 6.7: capacity, shutdown, rate limits, and the 503/504 race."""
+
+    def test_embedding_capacity_refusal_is_503_capacity(self, harness):
+        harness.cursor.rows = [_row()]
+        harness.use_limiters(_saturated_limiters(embedding_limit=0))
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": rag_service.DETAIL_CAPACITY}
+        assert response.headers["Retry-After"] == "1"
+        # Admission ran before the provider was ever called.
+        assert harness.embedding.calls == []
+        assert harness.generation.requests == []
+
+    def test_generation_capacity_refusal_is_503_capacity(self, harness):
+        harness.cursor.rows = [_row()]
+        harness.use_limiters(
+            _saturated_limiters(embedding_limit=4, generation_limit=0)
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": rag_service.DETAIL_CAPACITY}
+        assert response.headers["Retry-After"] == "1"
+        # Retrieval (embedding) was admitted; generation was refused.
+        assert harness.embedding.calls
+        assert harness.generation.requests == []
+
+    def test_shutdown_refusal_is_503_capacity_not_500(self, harness):
+        harness.cursor.rows = [_row()]
+        limiters = _saturated_limiters()
+        limiters.signal_shutdown()
+        harness.use_limiters(limiters)
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": rag_service.DETAIL_CAPACITY}
+        assert response.headers["Retry-After"] == "1"
+        assert harness.embedding.calls == []
+
+    def test_capacity_503_never_races_the_deadline_504(
+        self, harness, monkeypatch
+    ):
+        harness.cursor.rows = [_row()]
+        monkeypatch.setattr(
+            rag_service,
+            "get_settings",
+            lambda: SimpleNamespace(rag_request_deadline_seconds=0.1),
+        )
+        # A long admission budget cannot outlive the 0.1 s deadline: the
+        # 0.25 s admission margin refuses capacity immediately.
+        harness.use_limiters(
+            _saturated_limiters(embedding_limit=0, rag_wait_seconds=5.0)
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": rag_service.DETAIL_CAPACITY}
+        assert response.headers["Retry-After"] == "1"
+
+    def test_rate_limited_embedding_keeps_503_and_adds_retry_after(
+        self, harness
+    ):
+        harness.cursor.rows = [_row()]
+        harness.embedding = StubEmbeddingProvider(
+            error=EmbeddingError(
+                "simulated upstream rate limit",
+                stage="rate_limited",
+                retry_after_seconds=7,
+            )
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.status_code != 429
+        assert response.json() == {"detail": rag_service.DETAIL_KB_UNAVAILABLE}
+        assert response.headers["Retry-After"] == "7"
+        assert "simulated upstream rate limit" not in response.text
+
+    def test_rate_limited_generation_hint_is_clamped_to_60(self, harness):
+        harness.cursor.rows = [_row()]
+        harness.generation.error = GenerationError(
+            "The RAG answer could not be generated",
+            stage="rate_limited",
+            retry_after_seconds=3600,
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": rag_service.DETAIL_GENERATION_UNAVAILABLE,
+        }
+        assert response.headers["Retry-After"] == "60"
+
+    def test_rate_limit_without_a_hint_still_advises_one_second(self, harness):
+        harness.cursor.rows = [_row()]
+        harness.generation.error = GenerationError(
+            "The RAG answer could not be generated",
+            stage="rate_limited",
+            retry_after_seconds=None,
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "1"
+
+    def test_non_rate_limited_failures_carry_no_retry_after(self, harness):
+        harness.cursor.rows = [_row()]
+        harness.embedding = StubEmbeddingProvider(
+            error=EmbeddingError("simulated outage")
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 503
+        assert "Retry-After" not in response.headers
+
+    def test_successful_query_through_admission_still_answers(self, harness):
+        harness.cursor.rows = [_row()]
+        # The default registry from the app is used: the request is
+        # admitted, embedded, generated, and answered normally.
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 200
+        assert len(harness.embedding.calls) == 1
+        assert len(harness.generation.requests) == 1

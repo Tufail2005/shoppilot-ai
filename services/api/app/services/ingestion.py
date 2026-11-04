@@ -77,6 +77,12 @@ from collections.abc import Sequence
 from psycopg_pool import AsyncConnectionPool
 from storage3 import SyncStorageClient
 
+from app.core.provider_concurrency import (
+    ADMISSION_DEADLINE_MARGIN_SECONDS,
+    ProviderBusyError,
+    ProviderLimiters,
+    run_bounded,
+)
 from app.repositories import documents as documents_repository
 from app.services.chunking import DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP, chunk_text
 from app.services.documents import PDFExtractionError, extract_text
@@ -279,24 +285,95 @@ def _aligned_chunks(
     return rows
 
 
+def _embed_batches(
+    embedding_provider: EmbeddingProvider,
+    chunks: list[str],
+    batch_size: int,
+    *,
+    cancel_event=None,
+) -> list[list[float]]:
+    """Embed every chunk batch from inside ONE worker call.
+
+    Phase 6.7: this runs as the single worker function of one
+    :func:`~app.core.provider_concurrency.run_bounded` admission, so the
+    ingestion gate and the shared embedding permit are each acquired
+    exactly once per document and held for the whole embedding stage.
+    Batches stay strictly sequential — never concurrent — and the
+    provider's own bounded retry policy applies inside each call.
+    """
+
+    vectors: list[list[float]] = []
+
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start:start + batch_size]
+        vectors.extend(
+            embedding_provider.embed_documents(
+                batch,
+                cancel_event=cancel_event,
+            )
+        )
+
+    return vectors
+
+
 async def _embedded(
     embedding_provider: EmbeddingProvider,
     chunks: list[str],
     document_id: uuid.UUID,
     *,
     batch_size: int,
+    limiters: ProviderLimiters | None = None,
+    deadline_at: float | None = None,
 ) -> list[list[float]]:
     """Embed chunks in bounded, strictly sequential batches.
 
-    Each batch is handled by one ``embed_documents`` call executed in
-    a worker thread through ``asyncio.to_thread`` — the provider is a
-    synchronous, potentially slow client, and each call is awaited to
-    completion before the next batch starts. Batches are never issued
-    concurrently and no retries or backoff are applied.
+    Each batch is handled by one ``embed_documents`` call executed in a
+    worker thread — the provider is a synchronous, potentially slow
+    client, and each batch is awaited to completion before the next one
+    starts. Batches are never issued concurrently.
+
+    Phase 6.7: when `limiters` is supplied the whole batch sequence runs
+    under ONE combined admission (``ingestion_gate`` then
+    ``embedding``), so only one ingestion embeds at a time and the
+    shared embedding budget is respected. A capacity/shutdown refusal is
+    reported as the sanitized ``embedding_saturated`` stage.
+    ``limiters=None`` keeps the exact Phase 6.5 behavior (a bare
+    ``asyncio.to_thread`` per batch).
 
     Raises ``IngestionError`` when any batch fails, with the original
     exception chained.
     """
+
+    if limiters is not None:
+        try:
+            return await run_bounded(
+                ("ingestion_gate", "embedding"),
+                limiters,
+                _embed_batches,
+                embedding_provider,
+                chunks,
+                batch_size,
+                deadline_at=deadline_at,
+                margin=ADMISSION_DEADLINE_MARGIN_SECONDS,
+            )
+        except ProviderBusyError as exc:
+            # ProviderBusyError covers ProviderShutdownError: both are
+            # transient refusals, and neither is an embedding failure.
+            _log_failure("embedding_saturated", document_id, exc)
+
+            raise IngestionError(
+                "Embedding capacity is temporarily unavailable",
+                stage="embedding_saturated",
+            ) from exc
+        except Exception as exc:
+            # Same normalization as the unlimited path below, so the
+            # recorded failure stage does not depend on admission.
+            _log_failure("embedding_generation", document_id, exc)
+
+            raise IngestionError(
+                "Embedding generation failed for a document",
+                stage="embedding_generation",
+            ) from exc
 
     vectors: list[list[float]] = []
 
@@ -330,6 +407,8 @@ async def ingest_document(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_OVERLAP,
     batch_size: int = EMBEDDING_BATCH_SIZE,
+    limiters: ProviderLimiters | None = None,
+    deadline_at: float | None = None,
 ) -> int:
     """Ingest one uploaded document into ``document_chunks``.
 
@@ -350,6 +429,12 @@ async def ingest_document(
     route integration.
 
     Returns the number of chunk rows inserted.
+
+    Phase 6.7: when `limiters` is supplied, the whole embedding stage
+    runs under one combined provider admission (``ingestion_gate`` then
+    ``embedding``) bounded by `deadline_at`; a capacity or shutdown
+    refusal is normalized to ``IngestionError(stage="embedding_saturated")``.
+    ``limiters=None`` keeps the previous direct-provider behavior.
 
     Raises ``IngestionError`` when any stage fails; the original
     exception is always chained for debugging. Raises ``ValueError``
@@ -373,6 +458,8 @@ async def ingest_document(
         chunks,
         document_id,
         batch_size=batch_size,
+        limiters=limiters,
+        deadline_at=deadline_at,
     )
     chunk_rows = _aligned_chunks(chunks, vectors)
 

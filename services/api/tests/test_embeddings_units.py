@@ -7,12 +7,16 @@ replays canned responses.
 """
 
 import math
+import threading
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from google.genai import errors as legacy_errors
 from google.genai import types
 from pydantic import SecretStr
 
+from app.core.provider_retry import ProviderCallAborted, RetryPolicy
 from app.services import embeddings as embeddings_module
 from app.services.embeddings import (
     EMBEDDING_DIMENSIONS,
@@ -61,6 +65,28 @@ class FakeModelsApi:
 
 def _make_provider(api) -> GeminiEmbeddingProvider:
     return GeminiEmbeddingProvider(SimpleNamespace(models=api))
+
+
+class SequencedModelsApi(FakeModelsApi):
+    """Fails with the given exceptions in order, then succeeds."""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.pending_errors = list(errors)
+
+    def embed_content(self, *, model, contents, config):
+        if self.pending_errors:
+            error = self.pending_errors.pop(0)
+            self.requests.append(
+                {"model": model, "contents": contents, "config": config}
+            )
+            raise error
+
+        return super().embed_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
 
 
 def _request_texts(request) -> list[str]:
@@ -317,8 +343,87 @@ class TestResponseValidation:
             provider.embed_documents(["text"])
 
 
-def _settings_with(key):
-    return SimpleNamespace(gemini_api_key=key)
+def _settings_with(key, timeout_seconds=10.0):
+    return SimpleNamespace(
+        gemini_api_key=key,
+        gemini_embedding_timeout_seconds=timeout_seconds,
+        gemini_retry_max_attempts=2,
+        gemini_retry_initial_delay_seconds=0.25,
+        gemini_retry_window_seconds=3.0,
+    )
+
+
+class TestProviderTimeouts:
+    """Phase 6.6: per-request SDK HTTP timeout wiring and sanitization."""
+
+    def test_configured_timeout_is_sent_as_milliseconds(self):
+        api = FakeModelsApi()
+        provider = GeminiEmbeddingProvider(
+            SimpleNamespace(models=api), timeout_seconds=2.5
+        )
+
+        provider.embed_query(["text"])
+
+        http_options = api.requests[0]["config"].http_options
+
+        assert http_options is not None
+        assert http_options.timeout == 2500
+
+    def test_no_http_options_when_timeout_is_none(self):
+        api = FakeModelsApi()
+
+        _make_provider(api).embed_query(["text"])
+
+        assert api.requests[0]["config"].http_options is None
+
+    def test_sub_millisecond_timeout_never_becomes_zero(self):
+        api = FakeModelsApi()
+        provider = GeminiEmbeddingProvider(
+            SimpleNamespace(models=api), timeout_seconds=0.0001
+        )
+
+        provider.embed_query(["text"])
+
+        assert api.requests[0]["config"].http_options.timeout == 1
+
+    def test_timeout_failure_raises_sanitized_embedding_error(self):
+        original = httpx.ReadTimeout("stalled at https://internal.example/v1")
+        api = FakeModelsApi(error=original)
+        provider = _make_provider(api)
+
+        with pytest.raises(EmbeddingError, match="timed out") as raised:
+            provider.embed_query(["text"])
+
+        assert raised.value.__cause__ is original
+        assert "internal.example" not in str(raised.value)
+
+    def test_timeout_wrapped_by_the_sdk_is_still_translated(self):
+        """A timeout reached through the SDK wrapper keeps its stage.
+
+        The SDK reports a stalled call as ``APITimeoutError`` with the
+        original ``httpx.ReadTimeout`` as ``__cause__``; both links must
+        classify as a timeout.
+        """
+        compat_errors = pytest.importorskip(
+            "google.genai._gaos.lib.compat_errors"
+        )
+        request = httpx.Request("POST", "https://example.invalid/v1")
+        original = compat_errors.APITimeoutError(request)
+        api = FakeModelsApi(error=original)
+        provider = _make_provider(api)
+
+        with pytest.raises(EmbeddingError, match="timed out") as raised:
+            provider.embed_query(["text"])
+
+        assert raised.value.__cause__ is original
+
+    @pytest.mark.parametrize("bad_timeout", [0, -1, float("nan"), float("inf")])
+    def test_invalid_constructor_timeout_is_rejected(self, bad_timeout):
+        with pytest.raises(ValueError):
+            GeminiEmbeddingProvider(
+                SimpleNamespace(models=FakeModelsApi()),
+                timeout_seconds=bad_timeout,
+            )
 
 
 class TestProviderFactory:
@@ -354,3 +459,184 @@ class TestProviderFactory:
         assert isinstance(provider, GeminiEmbeddingProvider)
         assert provider._client.models == "fake-models"
         assert created["api_key"] == "test-key"
+
+    def test_factory_injects_the_configured_timeout(self, monkeypatch):
+        from google import genai
+
+        api = FakeModelsApi()
+
+        def fake_client_factory(*, api_key):
+            return SimpleNamespace(models=api)
+
+        monkeypatch.setattr(
+            embeddings_module,
+            "get_settings",
+            lambda: _settings_with(SecretStr("test-key"), timeout_seconds=4.0),
+        )
+        monkeypatch.setattr(genai, "Client", fake_client_factory)
+
+        provider = create_gemini_provider()
+        provider.embed_query(["anything"])
+
+        assert api.requests[0]["config"].http_options.timeout == 4000
+
+    def test_factory_injects_the_configured_retry_policy(self, monkeypatch):
+        from google import genai
+
+        created = {}
+
+        class RecordingProvider(GeminiEmbeddingProvider):
+            def __init__(self, client, *, retry_policy=None, **kwargs):
+                created["retry_policy"] = retry_policy
+                super().__init__(client, retry_policy=retry_policy, **kwargs)
+
+        monkeypatch.setattr(
+            embeddings_module,
+            "GeminiEmbeddingProvider",
+            RecordingProvider,
+        )
+        monkeypatch.setattr(
+            embeddings_module,
+            "get_settings",
+            lambda: _settings_with(SecretStr("test-key")),
+        )
+        monkeypatch.setattr(
+            genai,
+            "Client",
+            lambda *, api_key: SimpleNamespace(models=FakeModelsApi()),
+        )
+
+        create_gemini_provider()
+
+        assert created["retry_policy"] == RetryPolicy(
+            max_attempts=2,
+            initial_delay_seconds=0.25,
+            retry_window_seconds=3.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bounded retries (Phase 6.7)
+# ---------------------------------------------------------------------------
+
+
+def _retrying_provider(api, **overrides) -> GeminiEmbeddingProvider:
+    policy = {
+        "max_attempts": 3,
+        "initial_delay_seconds": 0.001,
+        "retry_window_seconds": 3.0,
+    }
+    policy.update(overrides)
+
+    return GeminiEmbeddingProvider(
+        SimpleNamespace(models=api),
+        retry_policy=RetryPolicy(**policy),
+    )
+
+
+def _transient_error():
+    return httpx.ConnectError(
+        "boom", request=httpx.Request("POST", "https://example.invalid")
+    )
+
+
+class TestBoundedRetries:
+    def test_transient_failure_is_retried_then_succeeds(self):
+        api = SequencedModelsApi([_transient_error()])
+        provider = _retrying_provider(api)
+
+        vectors = provider.embed_query(["text"])
+
+        assert len(api.requests) == 2
+        assert len(vectors) == 1
+
+    def test_exhausted_retries_report_provider_unavailable(self):
+        api = FakeModelsApi(error=_transient_error())
+        provider = _retrying_provider(api, max_attempts=2)
+
+        with pytest.raises(EmbeddingError) as raised:
+            provider.embed_query(["text"])
+
+        assert raised.value.stage == "provider_unavailable"
+        assert len(api.requests) == 2
+        assert isinstance(raised.value.__cause__, httpx.ConnectError)
+
+    def test_timeout_is_never_retried(self):
+        timeout = httpx.ReadTimeout(
+            "slow", request=httpx.Request("POST", "https://example.invalid")
+        )
+        api = SequencedModelsApi([timeout])
+        provider = _retrying_provider(api)
+
+        with pytest.raises(EmbeddingError) as raised:
+            provider.embed_query(["text"])
+
+        assert raised.value.stage == "embedding_timeout"
+        assert len(api.requests) == 1
+
+    def test_rate_limited_failure_reports_stage_and_hint(self):
+        response = httpx.Response(
+            429,
+            headers={"Retry-After": "5"},
+            request=httpx.Request("POST", "https://example.invalid"),
+        )
+        api = FakeModelsApi(
+            error=legacy_errors.APIError(429, {"error": "rate"}, response)
+        )
+        provider = _retrying_provider(api, max_attempts=1)
+
+        with pytest.raises(EmbeddingError) as raised:
+            provider.embed_query(["text"])
+
+        assert raised.value.stage == "rate_limited"
+        assert raised.value.retry_after_seconds == 5.0
+        assert len(api.requests) == 1
+
+    def test_fatal_failure_keeps_the_request_stage(self):
+        api = FakeModelsApi(
+            error=legacy_errors.APIError(401, {"error": "denied"})
+        )
+        provider = _retrying_provider(api)
+
+        with pytest.raises(EmbeddingError) as raised:
+            provider.embed_query(["text"])
+
+        assert raised.value.stage == "provider_request"
+        assert len(api.requests) == 1
+
+    def test_cancelled_before_the_first_attempt_makes_no_call(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        api = FakeModelsApi()
+        provider = _retrying_provider(api)
+
+        with pytest.raises(ProviderCallAborted):
+            provider.embed_query(["text"], cancel_event=cancel_event)
+
+        assert api.requests == []
+
+    def test_cancellation_during_backoff_propagates_unwrapped(self):
+        cancel_event = threading.Event()
+        api = FakeModelsApi(error=_transient_error())
+        original = api.embed_content
+
+        def cancelling(**kwargs):
+            cancel_event.set()
+            return original(**kwargs)
+
+        api.embed_content = cancelling
+        provider = _retrying_provider(api, initial_delay_seconds=0.3)
+
+        with pytest.raises(ProviderCallAborted):
+            provider.embed_query(["text"], cancel_event=cancel_event)
+
+        assert len(api.requests) == 1
+
+    def test_default_direct_provider_makes_exactly_one_attempt(self):
+        api = FakeModelsApi(error=_transient_error())
+        provider = _make_provider(api)
+
+        with pytest.raises(EmbeddingError):
+            provider.embed_query(["text"])
+
+        assert len(api.requests) == 1

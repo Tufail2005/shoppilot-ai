@@ -102,7 +102,9 @@ class FakeEmbeddingProvider:
         self.calls: list[list[str]] = []
         self._invocations = 0
 
-    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_documents(
+        self, texts: Sequence[str], *, cancel_event=None
+    ) -> list[list[float]]:
         batch_index = self._invocations
         self._invocations += 1
 
@@ -148,5 +150,7 @@ class FakeEmbeddingProvider:
 
         return [encoded] + [self.offset] * (self.dimensions - 1)
 
-    def embed_query(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_query(
+        self, texts: Sequence[str], *, cancel_event=None
+    ) -> list[list[float]]:
         raise AssertionError("ingestion must only call embed_documents")

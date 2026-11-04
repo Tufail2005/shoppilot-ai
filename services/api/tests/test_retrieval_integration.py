@@ -206,11 +206,11 @@ class _StubQueryProvider:
         self.vector = vector
         self.calls: list[list[str]] = []
 
-    def embed_query(self, texts):
+    def embed_query(self, texts, *, cancel_event=None):
         self.calls.append(list(texts))
         return [list(self.vector) for _ in texts]
 
-    def embed_documents(self, texts):
+    def embed_documents(self, texts, *, cancel_event=None):
         raise AssertionError("retrieval must only call embed_query")
 
 

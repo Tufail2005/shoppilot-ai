@@ -47,8 +47,10 @@ The provider currently issues ONE API call per supplied batch of
 texts and performs no automatic sub-batching. Gemini embedding
 requests are limited to 8,192 input tokens per text (chunks of ~800
 estimated tokens fit comfortably), but the total batch size is not
-capped here. Production batch sizing and retry/backoff policy belong
-to the Phase 5.6 ingestion pipeline, not to this service.
+capped here. Production batch sizing belongs to the Phase 5.6
+ingestion pipeline; Phase 6.7 adds the bounded retry/backoff policy
+*inside* this adapter (provider timeouts are never retried) so one
+logical embedding call has one predictable outcome.
 
 Other conventions
 -----------------
@@ -77,6 +79,19 @@ from fastapi import HTTPException, status
 from google.genai import types
 
 from app.core.config import get_settings
+from app.core.provider_retry import (
+    KIND_RATE_LIMITED,
+    KIND_TIMEOUT,
+    KIND_TRANSIENT,
+    ProviderCallAborted,
+    ProviderCallError,
+    RetryPolicy,
+    call_with_retries,
+)
+from app.core.provider_timeouts import (
+    timeout_milliseconds,
+    validate_timeout_seconds,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -100,7 +115,24 @@ class EmbeddingError(Exception):
     exception chaining), and invalid API responses (missing embeddings,
     wrong response counts, wrong dimensionality, non-numeric or
     non-finite values, accidental aggregated responses).
+
+    ``stage`` is a controlled slug for the sanitized HTTP mapping: the
+    response-validation failures keep the historical
+    ``provider_request`` stage, while Phase 6.7 adds ``embedding_timeout``,
+    ``rate_limited``, and ``provider_unavailable``. ``retry_after_seconds``
+    carries the provider's advisory hint (never provider message text).
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str = "provider_request",
+        retry_after_seconds: float | None = None,
+    ):
+        super().__init__(message)
+        self.stage = stage
+        self.retry_after_seconds = retry_after_seconds
 
 
 class EmbeddingProvider(Protocol):
@@ -114,13 +146,28 @@ class EmbeddingProvider(Protocol):
 
     Both methods accept a sequence of strings and return exactly one
     768-dimensional vector per input, preserving input order.
+
+    ``cancel_event`` is optional and keyword-only: the Phase 6.7
+    admission layer passes a ``threading.Event`` that is set at shutdown
+    so a worker observes cancellation before issuing a new provider
+    request. ``None`` keeps plain direct-provider behavior.
     """
 
-    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        cancel_event=None,
+    ) -> list[list[float]]:
         """Embed document texts for retrieval (asymmetric "document" side)."""
         ...
 
-    def embed_query(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_query(
+        self,
+        texts: Sequence[str],
+        *,
+        cancel_event=None,
+    ) -> list[list[float]]:
         """Embed retrieval query texts (asymmetric "query" side)."""
         ...
 
@@ -190,28 +237,58 @@ class GeminiEmbeddingProvider:
         *,
         model: str = EMBEDDING_MODEL,
         dimensions: int = EMBEDDING_DIMENSIONS,
+        timeout_seconds: float | None = None,
+        retry_policy: RetryPolicy | None = None,
     ):
         self._client = client
         self._model = model
         self._dimensions = dimensions
+        # Phase 6.6: the per-request SDK HTTP timeout, stored in the
+        # milliseconds unit HttpOptions expects. ``None`` keeps the SDK
+        # default (no http_options are added to the request config), so a
+        # directly constructed provider behaves exactly as before.
+        self._timeout_ms = (
+            None
+            if timeout_seconds is None
+            else timeout_milliseconds(
+                timeout_seconds, name="gemini_embedding_timeout_seconds"
+            )
+        )
+        # Phase 6.7: a directly constructed provider makes exactly one
+        # attempt unless a policy is injected, preserving the previous
+        # behavior; the production factory always passes the configured
+        # policy.
+        self._retry_policy = (
+            RetryPolicy(max_attempts=1) if retry_policy is None else retry_policy
+        )
 
-    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        cancel_event=None,
+    ) -> list[list[float]]:
         """Embed document texts with the document-side prompt format."""
         formatted = (
             _format_document_text(text)
             for text in _validated_texts(texts, method="documents")
         )
-        return self._embed(formatted)
+        return self._embed(formatted, cancel_event=cancel_event)
 
-    def embed_query(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_query(
+        self,
+        texts: Sequence[str],
+        *,
+        cancel_event=None,
+    ) -> list[list[float]]:
         """Embed query texts with the query-side prompt format."""
         formatted = (
             _format_query_text(text)
             for text in _validated_texts(texts, method="query")
         )
-        return self._embed(formatted)
+        return self._embed(formatted, cancel_event=cancel_event)
 
-    def _embed(self, formatted_texts) -> list[list[float]]:
+    def _embed(self, formatted_texts, *, cancel_event=None) -> list[list[float]]:
         formatted = list(formatted_texts)
 
         # An empty batch must never reach the API.
@@ -227,25 +304,103 @@ class GeminiEmbeddingProvider:
         ]
 
         try:
-            response = self._client.models.embed_content(
-                model=self._model,
-                contents=contents,
-                config=types.EmbedContentConfig(
-                    output_dimensionality=self._dimensions
+            response = call_with_retries(
+                lambda: self._client.models.embed_content(
+                    model=self._model,
+                    contents=contents,
+                    config=self._build_config(),
                 ),
+                policy=self._retry_policy,
+                cancel_event=cancel_event,
             )
-        except Exception as exc:
+        except ProviderCallAborted:
+            # Must reach the admission layer unwrapped so it maps to a
+            # sanitized shutdown 503 instead of an unknown 500.
+            raise
+        except ProviderCallError as exc:
+            # Log the exception type only: SDK messages can quote URLs or
+            # request details, which must never be logged.
             logger.error(
-                "Gemini embedding request failed: %s: %s",
-                type(exc).__name__,
-                exc,
+                "Gemini embedding request failed: %s (%s after %d attempt(s))",
+                type(exc.__cause__).__name__,
+                exc.kind,
+                exc.attempts,
             )
-
+            raise self._translate_failure(
+                exc, count=len(contents)
+            ) from self._original_cause(exc)
+        except Exception as exc:  # pragma: no cover - retry helper is total
+            logger.error(
+                "Gemini embedding request failed: %s",
+                type(exc).__name__,
+            )
             raise EmbeddingError(
                 f"Gemini embedding request failed for {len(contents)} text(s)"
             ) from exc
 
         return self._extract_vectors(response, expected_count=len(contents))
+
+    @staticmethod
+    def _original_cause(exc: ProviderCallError) -> BaseException:
+        """The provider exception the retry helper chained, if any."""
+        return exc.__cause__ if exc.__cause__ is not None else exc
+
+    @staticmethod
+    def _translate_failure(
+        exc: ProviderCallError,
+        *,
+        count: int,
+    ) -> EmbeddingError:
+        """Map a classified provider failure to a sanitized error.
+
+        Timeouts, rate limiting, and temporary upstream failures get
+        distinct stages so the Phase 6.7 HTTP mapping can answer 504,
+        503 (rate limit), and 503 (unavailable) without quoting provider
+        message text.
+        """
+        if exc.kind == KIND_TIMEOUT:
+            return EmbeddingError(
+                f"Gemini embedding request timed out for {count} text(s)",
+                stage="embedding_timeout",
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+
+        if exc.kind == KIND_RATE_LIMITED:
+            return EmbeddingError(
+                f"Gemini embedding request was rate limited for {count} text(s)",
+                stage="rate_limited",
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+
+        if exc.kind == KIND_TRANSIENT:
+            return EmbeddingError(
+                f"Gemini embedding request failed for {count} text(s)",
+                stage="provider_unavailable",
+            )
+
+        return EmbeddingError(
+            f"Gemini embedding request failed for {count} text(s)",
+            stage="provider_request",
+        )
+
+    def _build_config(self) -> types.EmbedContentConfig:
+        """Build the per-request embedding config.
+
+        Phase 6.6: a configured HTTP timeout is applied PER REQUEST via
+        ``EmbedContentConfig.http_options`` — the SDK merges it with the
+        client options and expects milliseconds. No client-level timeout
+        is set. When no timeout is configured the field is omitted
+        entirely, leaving the SDK default untouched.
+        """
+        if self._timeout_ms is None:
+            return types.EmbedContentConfig(
+                output_dimensionality=self._dimensions
+            )
+
+        return types.EmbedContentConfig(
+            output_dimensionality=self._dimensions,
+            http_options=types.HttpOptions(timeout=self._timeout_ms),
+        )
 
     def _extract_vectors(self, response, *, expected_count: int) -> list[list[float]]:
         """Validate the API response shape and return plain float vectors.
@@ -398,6 +553,14 @@ def create_gemini_provider() -> GeminiEmbeddingProvider:
             "or services/api/.env before embedding text"
         )
 
+    # Phase 6.6: the per-call HTTP timeout comes from configuration and
+    # is injected here (the production path). It is validated explicitly
+    # because pydantic's ``Field(gt=0)`` cannot reject ``inf``.
+    timeout_seconds = validate_timeout_seconds(
+        settings.gemini_embedding_timeout_seconds,
+        name="gemini_embedding_timeout_seconds",
+    )
+
     # Deferred import: constructing the client is the only thing that
     # requires the key to be usable.
     from google import genai
@@ -410,4 +573,8 @@ def create_gemini_provider() -> GeminiEmbeddingProvider:
             "credentials"
         ) from exc
 
-    return GeminiEmbeddingProvider(client)
+    return GeminiEmbeddingProvider(
+        client,
+        timeout_seconds=timeout_seconds,
+        retry_policy=RetryPolicy.from_settings(settings),
+    )

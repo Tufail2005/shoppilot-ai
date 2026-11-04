@@ -9,6 +9,7 @@ from fastapi import HTTPException, UploadFile, status
 from psycopg_pool import AsyncConnectionPool
 from storage3 import SyncStorageClient
 
+from app.core.provider_concurrency import ProviderLimiters
 from app.repositories import documents as documents_repository
 from app.services.embeddings import EmbeddingProvider
 from app.storage import DOCUMENTS_BUCKET
@@ -159,6 +160,81 @@ def _remove_object_safely(storage: SyncStorageClient, storage_path: str) -> None
             type(exc).__name__,
         )
 
+_CLEANUP_TASKS: set[asyncio.Task] = set()
+
+
+async def _storage_object_is_registered(
+    pool: AsyncConnectionPool,
+    storage_path: str,
+) -> bool:
+    """Check whether the Storage object has a committed document record."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM public.documents
+                    WHERE storage_path = %s
+                )
+                """,
+                (storage_path,),
+            )
+            row = await cursor.fetchone()
+
+    return bool(row[0])
+
+
+async def _cleanup_cancelled_upload(
+    pool: AsyncConnectionPool,
+    storage: SyncStorageClient,
+    storage_path: str,
+) -> None:
+    """Remove an uploaded object only if registration did not commit."""
+    try:
+        registered = await _storage_object_is_registered(
+            pool,
+            storage_path,
+        )
+    except Exception as exc:
+        # Commit outcome could be uncertain. Preserve the object rather
+        # than risk deleting one referenced by a committed database row.
+        logger.error(
+            "Cancelled upload cleanup could not verify registration: %s",
+            type(exc).__name__,
+        )
+        return
+
+    if registered:
+        logger.info(
+            "Storage cleanup skipped: document registration already committed."
+        )
+        return
+
+    await asyncio.to_thread(
+        _remove_object_safely,
+        storage,
+        storage_path,
+    )
+
+
+def _schedule_cancelled_upload_cleanup(
+    pool: AsyncConnectionPool,
+    storage: SyncStorageClient,
+    storage_path: str,
+) -> None:
+    """Schedule cleanup without swallowing the original cancellation."""
+    task = asyncio.create_task(
+        _cleanup_cancelled_upload(
+            pool,
+            storage,
+            storage_path,
+        )
+    )
+
+    _CLEANUP_TASKS.add(task)
+    task.add_done_callback(_CLEANUP_TASKS.discard)
+
 
 async def _read_upload_limited(upload: UploadFile) -> bytes:
     """Read the upload with a bounded strategy and verify PDF content.
@@ -209,6 +285,8 @@ async def upload_document(
     upload: UploadFile,
     visibility: str | None,
     embedding_provider: EmbeddingProvider,
+    limiters: ProviderLimiters | None = None,
+    deadline_at: float | None = None,
 ) -> dict:
     # Support agents may only publish internal documents.
     # The safe default is explicit and always overrides the DB default.
@@ -227,7 +305,14 @@ async def upload_document(
 
     # Storage and PostgreSQL do not share a transaction.
     # If the insert or commit fails, the uploaded object is removed.
-    _upload_to_storage(storage, storage_path, data)
+    # Run the synchronous Storage upload in a worker thread so it
+    # does not block the event loop.
+    await asyncio.to_thread(
+        _upload_to_storage,
+        storage,
+        storage_path,
+        data,
+    )
 
     try:
         async with pool.connection() as conn:
@@ -240,18 +325,31 @@ async def upload_document(
                 )
 
             await conn.commit()
+
+    except asyncio.CancelledError:
+        logger.warning(
+            "Document registration cancelled; scheduling Storage cleanup."
+        )
+
+        _schedule_cancelled_upload_cleanup(
+            pool,
+            storage,
+            storage_path,
+        )
+
+        raise
+
     except Exception as exc:
-        # The underlying database error is not logged with its message
-        # or traceback: only the stage and exception type. Database
-        # error text is uncontrolled and has previously carried query
-        # context; document registration failures must not reintroduce
-        # internal identifiers into logs.
         logger.error(
             "Failed to register document after Storage upload: %s",
             type(exc).__name__,
         )
 
-        _remove_object_safely(storage, storage_path)
+        await asyncio.to_thread(
+            _remove_object_safely,
+            storage,
+            storage_path,
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -266,8 +364,9 @@ async def upload_document(
         storage,
         embedding_provider,
         document=document,
+        limiters=limiters,
+        deadline_at=deadline_at,
     )
-
 
 def _remove_object(storage: SyncStorageClient, storage_path: str) -> None:
     """Remove one object from the private documents bucket.
@@ -295,71 +394,10 @@ async def delete_document(
     *,
     document_id: uuid.UUID,
 ) -> None:
-    """Delete one document: its row, its chunks (by cascade), and its Storage object.
+    """Delete a document, its chunks, and its storage object.
 
-    Phase 5.8. Route policy: admin-only (set in the router); the router
-    stays thin and this service owns the consistency and error-mapping
-    decisions.
-
-    Flow and consistency guarantees
-    -------------------------------
-
-    Storage and PostgreSQL share no transaction, so the deletion is
-    NOT atomic across the two systems. The observable contract is at
-    least as strong as this:
-
-    1. The document row is deleted with ``DELETE ... RETURNING
-       storage_path`` on an open database transaction. Zero returning
-       rows raise the sanitized 404 *before any Storage call* — an
-       unknown document id never touches Storage, because its object
-       path is only known from the row. The pending (empty) statement
-       is rolled back by the pool connection context manager.
-    2. The Storage object is removed (worker thread) while the
-       database transaction is still open. If the removal raises, the
-       pending row deletion is rolled back and a sanitized 503 is
-       raised: the document row, its cascaded chunks, and any
-       not-yet-removed object are untouched — *as far as the local
-       transaction observes*. The outcome is nevertheless potentially
-       uncertain: the remote delete may already have been applied
-       before the error surfaced, so a 503 can leave a row whose
-       object is already gone (row-without-object). This state is
-       documented, never claimed impossible, and self-healing (step
-       4).
-    3. Only after a removal without exception does the transaction
-       commit. A commit failure yields a sanitized 500 while the
-       object is already gone — again a possible row-without-object
-       state, documented rather than hidden. The database side had
-       never reported success.
-    4. A repeated deletion of the same document is always safe: a
-       row already gone produces the same 404, and removing a
-       nonexistent object succeeds on the real Storage API, so any
-       stale row (row present, object gone) heals on the next
-       deletion request, which then reports 204 with both sides
-       agreeing.
-
-    Success signal: a 204 is emitted only after the database
-    transaction committed AND the Storage removal did not raise; any
-    error response leaves the database side untouched from this
-    request's perspective.
-
-    Statuses: ``processing``, ``ready``, and ``failed`` documents are
-    equally deletable — no new lifecycle state is introduced. When
-    ingestion and deletion overlap on a ``processing`` document, the
-    database's foreign-key locking serializes them: either the
-    deleting transaction commits first (the ingestion's pending chunk
-    insert then fails its FK check and rolls back, and its status
-    write becomes the Phase 5.7 conflict path — a sanitized 500 to the
-    concurrent uploader), or it commits after ingestion (cascading the
-    freshly written chunks away). The database never ends up
-    inconsistent.
-
-    Logging: failures log the deletion stage, the document id (an
-    opaque internal UUID), and the exception type only — never
-    exception messages, storage paths, or internal identifiers. No
-    response ever carries a storage path or an internal error message.
-
-    Raises ``HTTPException`` 404/503/500 as documented above; the
-    original exception is chained onto each error for debugging.
+    Storage and DB writes are separate, so the method keeps a safe
+    failure path and returns sanitized 404/503/500 responses.
     """
     document_id = uuid.UUID(str(document_id))
 
@@ -443,52 +481,10 @@ async def update_document_visibility(
     document_id: uuid.UUID,
     visibility: str,
 ) -> dict:
-    """Update one document's visibility and return the updated document.
+    """Update a document's visibility and return the stored record.
 
-    Phase 5.9. Route policy: admin-only (enforced in the router).
-    Flipping `internal -> public` is a content-exposure grant, and the
-    documents table has no creator column to scope a support agent's
-    update right to their own uploads — mirroring the Phase 5.8
-    deletion rationale.
-
-    The service owns the consistency and error-mapping decisions; the
-    repository issues one parameterized UPDATE that touches exactly
-    `visibility` and `updated_at` (see
-    ``documents_repository.set_document_visibility``). Status, failure
-    fields, title, version, the storage path, the Storage object, the
-    document's chunks, and their embeddings are never touched, and no
-    request to this endpoint requires Storage or the embedding
-    provider at all.
-
-    Failure sequencing and uncertainty handling:
-
-    1. Statement failure (the UPDATE itself raises) — the pool
-       connection context manager rolls the statement back, the
-       database state is unchanged, and a sanitized 500 ("Document
-       could not be updated") is raised.
-    2. Zero returning rows — the document id does not exist; a
-       sanitized 404 is raised before any commit, and the pending
-       (no-op) statement is rolled back on context exit.
-    3. Commit failure — the UPDATE statement succeeded, so the commit
-       outcome is UNCERTAIN: the visibility change may already have
-       been applied remotely, or not. The failure is reported with a
-       sanitized 500 ("Document visibility update could not be
-       confirmed") that explicitly does NOT claim the database state
-       is unchanged; nothing here ever asserts persistence either way.
-       A caller that cannot obtain a confirmed outcome must re-read
-       the document's state before retrying.
-
-    Success signal: the returned document is only ever the row whose
-    UPDATE committed.
-
-    Logging: failures log the stage (`database_update` for statement
-    failures and `database_commit` for commit failures), the document
-    id (an opaque internal UUID), and the exception type only — never
-    exception messages, storage paths, or internal identifiers. No
-    response ever carries a storage path or an internal error message.
-
-    Raises ``HTTPException`` 404/500 as documented above; the original
-    exception is chained onto each error for debugging.
+    Route policy is admin-only; the repo updates only visibility and
+    the service maps DB failures to sanitized HTTP responses.
     """
     document_id = uuid.UUID(str(document_id))
 
@@ -564,15 +560,10 @@ async def update_document_visibility(
 
 
 def _finalized_failure_category(exc: Exception) -> tuple[str, str]:
-    """Map an ingestion failure to sanitized, persistable fields.
+    """Map ingestion errors to safe persisted stage/message pairs.
 
-    Returns the ``(failure_stage, failure_message)`` pair. For
-    ``IngestionError`` (the pipeline's normalized failure type) the
-    controlled stage slug and its static message — which never embed
-    storage paths, credentials, document text, vector values, or
-    uncontrolled exception text — are safe to store verbatim. Any
-    other exception is reduced to the literal `unexpected` category
-    and a fixed message; original exception text is discarded.
+    Unknown errors are reduced to a fixed ``unexpected`` outcome so raw
+    exception text is never stored.
     """
 
     # Deferred import: the ingestion service imports extract_text
@@ -661,11 +652,15 @@ async def _record_ingestion_failure(
     stage: str,
     message: str,
 ) -> dict:
-    # Ingestion failed; the failure is recorded on the existing
-    # document row. If this persistence fails, the original ingestion
-    # failure must not be misreported as success — a sanitized 500 is
-    # raised and the document stays `processing` (a documented
-    # Phase 5.7 limitation: no background recovery).
+    # Ingestion or cancellation failed; the outcome is recorded on
+    # the existing document row.
+    #
+    # If this persistence operation fails, the failure must not be
+    # misreported as success. A sanitized 500 is raised, and the
+    # document may remain `processing`.
+    #
+    # Cancellation markers are best-effort; there is no guaranteed
+    # background recovery mechanism for failed status persistence.
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cursor:
@@ -706,53 +701,144 @@ async def _record_ingestion_failure(
     return document
 
 
+# Controlled, persistable category for an ingestion that was cancelled
+# before it could finish (client disconnect or shutdown).
+_CANCELLATION_STAGE = "request_cancelled"
+_CANCELLATION_MESSAGE = "Document ingestion was interrupted before it finished"
+
+# Strong references to the background cancellation-marker tasks: the
+# event loop only keeps weak references to tasks, so an unreferenced
+# task could otherwise be garbage collected mid-flight.
+_CANCELLATION_TASKS: set[asyncio.Task] = set()
+
+
+async def _mark_cancelled_document(
+    pool: AsyncConnectionPool,
+    document_id: uuid.UUID,
+) -> None:
+    """Best-effort persistence of an interrupted ingestion's outcome.
+
+    Never raises: this runs detached from the cancelled request, and a
+    failure to record the marker must not surface anywhere except the
+    log (stage + exception type only).
+    """
+    try:
+        await _record_ingestion_failure(
+            pool,
+            document_id,
+            stage=_CANCELLATION_STAGE,
+            message=_CANCELLATION_MESSAGE,
+        )
+    except Exception as exc:
+        _log_persistence_failure("record_cancelled", document_id, exc)
+
+
+def _record_cancellation(
+    pool: AsyncConnectionPool,
+    document_id: uuid.UUID,
+) -> None:
+    """Schedule a detached marker for a cancelled ingestion.
+
+    Called from the ``asyncio.CancelledError`` handler, so the
+    interruption is recorded without delaying the cancellation itself.
+    The task is referenced in :data:`_CANCELLATION_TASKS` until it
+    completes.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # The coroutine is never constructed here, so no "coroutine was
+        # never awaited" warning can be produced by this path.
+        logger.error(
+            "Document %s cancellation could not be recorded: no event loop",
+            document_id,
+        )
+        return
+
+    task = loop.create_task(_mark_cancelled_document(pool, document_id))
+    _CANCELLATION_TASKS.add(task)
+    task.add_done_callback(_CANCELLATION_TASKS.discard)
+
+
 async def _ingest_registered_document(
     pool: AsyncConnectionPool,
-    storage: Client,
+    storage: SyncStorageClient,
     embedding_provider: EmbeddingProvider,
     *,
     document: dict,
+    limiters: ProviderLimiters | None = None,
+    deadline_at: float | None = None,
 ) -> dict:
     """Ingest one registered document and persist its terminal status.
 
-    Runs the existing Phase 5.6 pipeline unchanged. On success the
-    document is finalized as `ready` (only after the chunk
-    transaction committed). On any pipeline failure the document is
-    recorded as `failed` with sanitized fields; the caller always
-    receives the document's actual final state rather than an
-    exception, so the API response reports the created-but-failed
-    document under the same 201 contract as a successful upload.
+    Runs the existing Phase 5.6 ingestion pipeline. The document
+    lifecycle is:
 
-    `asyncio.CancelledError` is deliberately not caught: the open
-    pool connection rolls the chunk transaction back through its
-    context manager, the status update never runs, and the document
-    remains `processing` (abrupt-interruption limitation — see the
-    Phase 5.7 notes). Swallowing cancellation to attempt a database
-    write would risk hanging the shutdown instead.
+        registered (processing)
+            -> ingest_document()
+                -> extract PDF text
+                -> chunk text
+                -> embed all batches
+                -> persist document chunks transactionally
+            -> ready (only after successful chunk persistence)
+
+    Failure handling:
+    - An ingestion failure is recorded as `failed` with a sanitized
+      stage and message. The document row is returned under the
+      existing HTTP 201 contract.
+    - If failure-status persistence itself fails, a sanitized HTTP 500
+      is raised. The document may remain `processing`; no automatic
+      recovery is guaranteed for persistence failures.
+
+    Cancellation handling:
+    - asyncio.CancelledError is never converted into a successful
+      response or swallowed.
+    - Cancellation during ingestion or final status finalization
+      schedules a detached, strongly-referenced task that attempts
+      to transition the document from `processing` to `failed` with
+      the controlled `request_cancelled` stage.
+    - The marker is best-effort. Its failure is logged using only
+      the document ID, stage, and exception type.
+    - Cancellation is re-raised immediately; the request does not
+      wait for the detached marker.
+    - The guarded status transition prevents the cancellation marker
+      from overwriting a document that has already reached a terminal
+      state.
+
+    Success is reported only after the chunk transaction and the
+    document's `ready` status transition have both completed.
     """
 
     document_id = _document_id(document)
 
     try:
-        # Deferred import (see _finalized_failure_category): avoids
-        # the circular import with the ingestion service.
-        from app.services.ingestion import ingest_document
+        try:
+            # Deferred import avoids circular dependency.
+            from app.services.ingestion import ingest_document
 
-        await ingest_document(
-            pool,
-            storage,
-            embedding_provider,
-            document_id=document_id,
-            storage_path=document["storage_path"],
-        )
-    except Exception as exc:
-        stage, message = _finalized_failure_category(exc)
+            await ingest_document(
+                pool,
+                storage,
+                embedding_provider,
+                document_id=document_id,
+                storage_path=document["storage_path"],
+                limiters=limiters,
+                deadline_at=deadline_at,
+            )
 
-        return await _record_ingestion_failure(
-            pool,
-            document_id,
-            stage=stage,
-            message=message,
-        )
+        except Exception as exc:
+            stage, message = _finalized_failure_category(exc)
 
-    return await _mark_document_ready(pool, document_id)
+            return await _record_ingestion_failure(
+                pool,
+                document_id,
+                stage=stage,
+                message=message,
+            )
+
+        # Finalization is now inside the outer cancellation boundary.
+        return await _mark_document_ready(pool, document_id)
+
+    except asyncio.CancelledError:
+        _record_cancellation(pool, document_id)
+        raise

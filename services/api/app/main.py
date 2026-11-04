@@ -4,13 +4,25 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import get_current_user
+from app.core.config import settings
+from app.core.provider_concurrency import ProviderLimiters
 from app.db import init_db
 from app.routers import admin, orders, products, rag, tickets
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    limiters = ProviderLimiters.from_settings(settings)
+    app.state.provider_limiters = limiters
+
     async for _ in init_db(app):
-        yield
+        try:
+            yield
+        finally:
+            # Close admissions before the connection pool: waiting
+            # callers get a sanitized 503 and in-flight worker threads
+            # get a bounded grace period. Worker threads never use the
+            # pool, but this keeps the teardown order deterministic.
+            await limiters.aclose()
 
 
 app = FastAPI(

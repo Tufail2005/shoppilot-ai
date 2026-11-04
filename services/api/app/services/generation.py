@@ -104,6 +104,20 @@ from app.services.rag_prompt import (
     build_rag_prompt,
 )
 from app.core.config import get_settings
+from app.core.provider_concurrency import (
+    ADMISSION_DEADLINE_MARGIN_SECONDS,
+    ProviderLimiters,
+    run_bounded,
+)
+from app.core.provider_retry import (
+    KIND_RATE_LIMITED,
+    KIND_TIMEOUT,
+    ProviderCallAborted,
+    ProviderCallError,
+    RetryPolicy,
+    call_with_retries,
+)
+from app.core.provider_timeouts import validate_timeout_seconds
 from google.genai.interactions import TextContent
 from psycopg_pool import AsyncConnectionPool
 
@@ -123,9 +137,18 @@ class GenerationError(Exception):
     generated text, or key material.
     """
 
-    def __init__(self, message: str, *, stage: str):
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        retry_after_seconds: float | None = None,
+    ):
         super().__init__(message)
         self.stage = stage
+        # Phase 6.7: the provider's advisory ``Retry-After`` hint for a
+        # rate-limited call (never provider message text).
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GenerationProvider(Protocol):
@@ -135,9 +158,14 @@ class GenerationProvider(Protocol):
     never constructs or mutates prompt text) and returns the generated
     answer text. Implementations are synchronous, like the phase 5.5
     embedding provider; async callers offload them to a worker thread.
+
+    ``cancel_event`` is optional and keyword-only: the Phase 6.7
+    admission layer passes a ``threading.Event`` that is set at shutdown
+    so a worker observes cancellation before issuing a new provider
+    request. ``None`` keeps plain direct-provider behavior.
     """
 
-    def generate(self, prompt: RagPrompt) -> str:
+    def generate(self, prompt: RagPrompt, *, cancel_event=None) -> str:
         """Generate the answer text for one fully built prompt."""
         ...
 
@@ -151,11 +179,34 @@ class GeminiGenerationProvider:
     client without any network access or credentials.
     """
 
-    def __init__(self, client, *, model: str):
+    def __init__(
+        self,
+        client,
+        *,
+        model: str,
+        timeout_seconds: float | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ):
         self._client = client
         self._model = model
+        # Phase 6.6: the per-request SDK HTTP timeout, in seconds (the
+        # unit ``interactions.create(timeout=...)`` expects). ``None``
+        # omits the keyword entirely, so a directly constructed provider
+        # keeps whatever the client was configured with.
+        self._timeout_seconds = (
+            None
+            if timeout_seconds is None
+            else validate_timeout_seconds(
+                timeout_seconds, name="gemini_generation_timeout_seconds"
+            )
+        )
+        # Phase 6.7: one attempt by default for a directly constructed
+        # provider; the production factory injects the configured policy.
+        self._retry_policy = (
+            RetryPolicy(max_attempts=1) if retry_policy is None else retry_policy
+        )
 
-    def generate(self, prompt: RagPrompt) -> str:
+    def generate(self, prompt: RagPrompt, *, cancel_event=None) -> str:
         """Generate one answer from the Phase 6.2 prompt, statelessly."""
         if not isinstance(prompt, RagPrompt):
             raise TypeError(
@@ -177,25 +228,74 @@ class GeminiGenerationProvider:
             TextContent(text=prompt.sources_text),
         ]
 
+        request_kwargs = {
+            "model": self._model,
+            "input": contents,
+            "system_instruction": prompt.system_instruction,
+            "store": False,
+        }
+
+        # Phase 6.6: apply the configured per-request HTTP timeout only
+        # when one is set. The keyword is omitted otherwise so the SDK
+        # (or an injected test client) keeps its own default.
+        if self._timeout_seconds is not None:
+            request_kwargs["timeout"] = self._timeout_seconds
+
         try:
-            response = self._client.interactions.create(
-                model=self._model,
-                input=contents,
-                system_instruction=prompt.system_instruction,
-                store=False,
+            response = call_with_retries(
+                lambda: self._client.interactions.create(**request_kwargs),
+                policy=self._retry_policy,
+                cancel_event=cancel_event,
             )
-        except Exception as exc:
+        except ProviderCallAborted:
+            # Must reach the admission layer unwrapped so it maps to a
+            # sanitized shutdown 503 instead of an unknown 500.
+            raise
+        except ProviderCallError as exc:
+            logger.error(
+                "Gemini generation request failed: %s (%s after %d attempt(s))",
+                type(exc.__cause__).__name__,
+                exc.kind,
+                exc.attempts,
+            )
+
+            if exc.kind == KIND_TIMEOUT:
+                raise GenerationError(
+                    "The RAG answer could not be generated",
+                    stage="generation_timeout",
+                    retry_after_seconds=exc.retry_after_seconds,
+                ) from self._original_cause(exc)
+
+            if exc.kind == KIND_RATE_LIMITED:
+                raise GenerationError(
+                    "The RAG answer could not be generated",
+                    stage="rate_limited",
+                    retry_after_seconds=exc.retry_after_seconds,
+                ) from self._original_cause(exc)
+
+            # Temporary and fatal failures keep the historical
+            # ``generation_request`` stage.
+            raise GenerationError(
+                "The RAG answer could not be generated",
+                stage="generation_request",
+                retry_after_seconds=exc.retry_after_seconds,
+            ) from self._original_cause(exc)
+        except Exception as exc:  # pragma: no cover - retry helper is total
             logger.error(
                 "Gemini generation request failed: %s",
                 type(exc).__name__,
             )
-
             raise GenerationError(
                 "The RAG answer could not be generated",
                 stage="generation_request",
             ) from exc
 
         return self._extract_answer_text(response)
+
+    @staticmethod
+    def _original_cause(exc: ProviderCallError) -> BaseException:
+        """The provider exception the retry helper chained, if any."""
+        return exc.__cause__ if exc.__cause__ is not None else exc
 
     def _extract_answer_text(self, response) -> str:
         """Validate the Interactions response and extract the answer text.
@@ -345,6 +445,8 @@ async def generate_rag_answer(
     *,
     query: str,
     user_role: object,
+    limiters: ProviderLimiters | None = None,
+    deadline_at: float | None = None,
 ) -> RagAnswer:
     """Generate a grounded answer with citations for one user question.
 
@@ -362,12 +464,20 @@ async def generate_rag_answer(
     ``GenerationError``, and the prompt builder's ``TypeError``/
     ``ValueError`` propagate unchanged for Phase 6.4 to sanitize;
     provider/database failure text is never echoed to callers.
+
+    Phase 6.7: when `limiters` is supplied, both provider calls
+    (retrieval embedding and generation) pass through provider admission
+    control, using `deadline_at` to keep the bounded waits ahead of the
+    outer RAG deadline. ``limiters=None`` keeps the exact Phase 6.5
+    direct-provider behavior.
     """
     chunks = await retrieval_service.retrieve(
         pool,
         embedding_provider,
         query=query,
         user_role=user_role,
+        limiters=limiters,
+        deadline_at=deadline_at,
     )
 
     prompt = build_rag_prompt(query, chunks)
@@ -386,10 +496,20 @@ async def generate_rag_answer(
 
     # The provider is synchronous and makes a network call: offload to
     # a worker thread exactly like the Phase 5.6/6.1 embedding calls.
-    answer_text = await asyncio.to_thread(
-        generation_provider.generate,
-        prompt,
-    )
+    if limiters is None:
+        answer_text = await asyncio.to_thread(
+            generation_provider.generate,
+            prompt,
+        )
+    else:
+        answer_text = await run_bounded(
+            "generation",
+            limiters,
+            generation_provider.generate,
+            prompt,
+            deadline_at=deadline_at,
+            margin=ADMISSION_DEADLINE_MARGIN_SECONDS,
+        )
 
     citations = validate_citations(answer_text, prompt.sources)
 
@@ -434,6 +554,14 @@ def create_gemini_generation_provider() -> GeminiGenerationProvider:
             stage="configuration",
         )
 
+    # Phase 6.6: the per-call HTTP timeout comes from configuration and
+    # is injected here (the production path), validated explicitly
+    # because ``Field(gt=0)`` cannot reject ``inf``.
+    timeout_seconds = validate_timeout_seconds(
+        settings.gemini_generation_timeout_seconds,
+        name="gemini_generation_timeout_seconds",
+    )
+
     # Deferred import: constructing the client is the only thing that
     # requires the key to be usable.
     from google import genai
@@ -447,4 +575,9 @@ def create_gemini_generation_provider() -> GeminiGenerationProvider:
             stage="configuration",
         ) from exc
 
-    return GeminiGenerationProvider(client, model=model)
+    return GeminiGenerationProvider(
+        client,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        retry_policy=RetryPolicy.from_settings(settings),
+    )

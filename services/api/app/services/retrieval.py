@@ -71,6 +71,11 @@ from collections.abc import Sequence
 
 from psycopg_pool import AsyncConnectionPool
 
+from app.core.provider_concurrency import (
+    ADMISSION_DEADLINE_MARGIN_SECONDS,
+    ProviderLimiters,
+    run_bounded,
+)
 from app.repositories import retrieval as retrieval_repository
 from app.services.embeddings import EMBEDDING_DIMENSIONS, EmbeddingProvider
 
@@ -178,6 +183,8 @@ async def retrieve(
     *,
     query: str,
     user_role: object,
+    limiters: ProviderLimiters | None = None,
+    deadline_at: float | None = None,
 ) -> list[dict]:
     """Retrieve the permitted ``ready`` chunks most similar to `query`.
 
@@ -201,6 +208,13 @@ async def retrieve(
     Provider failures (``EmbeddingError``, ``TypeError``/``ValueError``
     for an invalid query) propagate unchanged; database failures raise
     :class:`RetrievalError` with the original cause chained.
+
+    Phase 6.7: when `limiters` is supplied the query embedding goes
+    through provider admission control instead of a bare
+    ``asyncio.to_thread`` — bounded concurrency, a bounded wait, and
+    shutdown awareness — and `deadline_at` shortens that wait so
+    admission can never race the RAG request deadline. ``limiters=None``
+    keeps the exact Phase 6.5 direct-provider behavior.
     """
 
     # Fail closed before anything else: no embedding call, no SQL.
@@ -208,10 +222,20 @@ async def retrieve(
 
     # The provider is synchronous and makes a network call: offload to
     # a worker thread exactly like the Phase 5.6 ingestion does.
-    vectors = await asyncio.to_thread(
-        embedding_provider.embed_query,
-        [query],
-    )
+    if limiters is None:
+        vectors = await asyncio.to_thread(
+            embedding_provider.embed_query,
+            [query],
+        )
+    else:
+        vectors = await run_bounded(
+            "embedding",
+            limiters,
+            embedding_provider.embed_query,
+            [query],
+            deadline_at=deadline_at,
+            margin=ADMISSION_DEADLINE_MARGIN_SECONDS,
+        )
 
     if not isinstance(vectors, Sequence) or isinstance(vectors, (str, bytes)):
         raise RetrievalError(

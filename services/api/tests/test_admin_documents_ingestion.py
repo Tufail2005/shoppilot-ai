@@ -34,6 +34,10 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette import status
 
+from app.core.provider_concurrency import (
+    ProviderLimiters,
+    get_provider_limiters,
+)
 from app.main import app
 from app.repositories import documents as documents_repository
 from app.services import embeddings as embeddings_module
@@ -596,3 +600,83 @@ class TestSanitizedLogsAndResponses:
             self._assert_hygiene(caplog, state, response)
         finally:
             _delete_by_state(state)
+
+
+class TestProviderAdmissionStage:
+    """Phase 6.7: the upload route runs ingestion behind admission control.
+
+    The limiters dependency is overridden with an always-at-capacity
+    registry (``BoundedSemaphore(0)``), so the real
+    ``_embedded`` -> ``run_bounded`` path must refuse the batch without
+    ever calling the provider and record the controlled
+    ``embedding_saturated`` stage on the row.
+    """
+
+    def test_saturated_embedding_capacity_records_its_own_stage(
+        self,
+        admin_client: TestClient,
+    ):
+        state = FakeStorageState()
+        provider = _install_fakes(state)
+
+        limiters = ProviderLimiters(
+            embedding_limit=0,
+            generation_limit=1,
+            rag_wait_seconds=0.05,
+            ingestion_wait_seconds=0.05,
+        )
+        app.dependency_overrides[get_provider_limiters] = lambda: limiters
+
+        try:
+            response = admin_client.post(
+                _DOCUMENT_URL,
+                files={
+                    "file": ("doc.pdf", _INGESTABLE_PDF, "application/pdf")
+                },
+            )
+        finally:
+            app.dependency_overrides.pop(get_provider_limiters, None)
+
+        document = response.json()
+
+        try:
+            assert response.status_code == status.HTTP_201_CREATED
+            assert document["status"] == "failed"
+            assert document["failure_stage"] == "embedding_saturated"
+            assert document["failure_message"] == (
+                "Embedding capacity is temporarily unavailable"
+            )
+            # Admission refused before any provider request was issued.
+            assert provider.calls == []
+
+            row = _fetch_document(document["id"])
+            assert row["status"] == "failed"
+            assert row["failure_stage"] == "embedding_saturated"
+        finally:
+            _delete_document(document["id"])
+
+    def test_upload_still_succeeds_through_the_default_registry(
+        self,
+        admin_client: TestClient,
+    ):
+        """The real (lazily created) limiter registry admits the batch."""
+
+        state = FakeStorageState()
+        provider = _install_fakes(state)
+
+        response = admin_client.post(
+            _DOCUMENT_URL,
+            files={"file": ("doc.pdf", _INGESTABLE_PDF, "application/pdf")},
+        )
+
+        document = response.json()
+
+        try:
+            assert response.status_code == status.HTTP_201_CREATED
+            assert document["status"] == "ready"
+            assert document["failure_stage"] is None
+            assert [
+                chunk for batch in provider.calls for chunk in batch
+            ] == list(_EXPECTED_CHUNKS)
+        finally:
+            _delete_document(document["id"])

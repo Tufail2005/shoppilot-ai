@@ -174,7 +174,7 @@ class StubQueryProvider:
         self.error = error
         self.calls: list[list[str]] = []
 
-    def embed_query(self, texts):
+    def embed_query(self, texts, *, cancel_event=None):
         self.calls.append(list(texts))
 
         if self.error is not None:
@@ -182,7 +182,7 @@ class StubQueryProvider:
 
         return [list(self.vector) for _ in texts]
 
-    def embed_documents(self, texts):
+    def embed_documents(self, texts, *, cancel_event=None):
         raise AssertionError("retrieval must only call embed_query")
 
 
@@ -194,7 +194,7 @@ class StubGenerationProvider:
         self.answer = answer
         self.error = error
 
-    def generate(self, prompt) -> str:
+    def generate(self, prompt, *, cancel_event=None) -> str:
         self.requests.append(prompt)
 
         if self.error is not None:
