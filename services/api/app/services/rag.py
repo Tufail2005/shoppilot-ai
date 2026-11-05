@@ -111,11 +111,13 @@ URLs, or key material.
 
 import asyncio
 import logging
+import time
 
 from fastapi import HTTPException, status
 from psycopg_pool import AsyncConnectionPool
 
 from app.core.config import get_settings
+from app.core.observability import provider_metrics as _provider_metrics
 from app.core.provider_concurrency import (
     ProviderBusyError,
     ProviderLimiters,
@@ -181,6 +183,30 @@ def _retry_after_headers(exc: Exception) -> dict[str, str] | None:
     }
 
 
+def now_seconds() -> float:
+    """The shared Phase 6.8 instrumentation clock (never a decision)."""
+    return time.monotonic()
+
+
+def _record_rag(outcome: str, started: float) -> None:
+    """Record one RAG request outcome and duration; NEVER raise.
+
+    Exactly one terminal observation per request: ``succeeded`` on a
+    returned answer, ``failed`` for every non-cancellation exception
+    (including the sanitized HTTP errors), ``caller_cancelled`` when
+    the request coroutine itself was cancelled.
+    """
+    labels = {"outcome": outcome}
+
+    try:
+        _provider_metrics.record_counter("rag_requests_total", labels)
+        _provider_metrics.record_duration(
+            "rag_request_seconds", labels, now_seconds() - started
+        )
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
+
+
 class LazyGenerationProvider:
     """A :class:`GenerationProvider` that defers configuration to first use.
 
@@ -240,6 +266,52 @@ def get_generation_provider() -> GenerationProvider:
 
 
 async def answer_query(
+    pool: AsyncConnectionPool,
+    embedding_provider: EmbeddingProvider,
+    generation_provider: GenerationProvider,
+    *,
+    query: str,
+    user_role: object,
+    limiters: ProviderLimiters | None = None,
+) -> RagAnswer:
+    """Answer one knowledge-base question (Phase 6.8: metrics observED).
+
+    Thin metrics boundary around :func:`_answer_query`: exactly one
+    terminal observation per request is recorded
+    (``rag_requests_total`` / ``rag_request_seconds``) — ``succeeded``
+    for a returned answer, ``failed`` for any non-cancellation failure
+    (the sanitized HTTP mapping is unchanged), ``caller_cancelled``
+    when the request coroutine is cancelled. Recording is best-effort
+    and never raises, so no HTTP status, detail, or exception flow
+    changes.
+    """
+    started = now_seconds()
+
+    try:
+        answer = await _answer_query(
+            pool,
+            embedding_provider,
+            generation_provider,
+            query=query,
+            user_role=user_role,
+            limiters=limiters,
+        )
+    except asyncio.CancelledError:
+        _record_rag("caller_cancelled", started)
+        raise
+    except Exception:
+        # Every sanitized HTTP mapping below (including the generic
+        # 500) is a terminal non-cancellation failure for the request
+        # family.
+        _record_rag("failed", started)
+        raise
+
+    _record_rag("succeeded", started)
+
+    return answer
+
+
+async def _answer_query(
     pool: AsyncConnectionPool,
     embedding_provider: EmbeddingProvider,
     generation_provider: GenerationProvider,

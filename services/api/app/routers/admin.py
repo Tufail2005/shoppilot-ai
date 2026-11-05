@@ -23,6 +23,41 @@ router = APIRouter(
     tags=["admin"],
 )
 
+# Module-level so tests can override the resolved user through
+# FastAPI's dependency_overrides without depending on the database.
+metrics_access = require_role("admin")
+
+
+@router.get(
+    "/metrics",
+    summary="Aggregate, process-local provider and pipeline metrics",
+)
+async def get_metrics_snapshot(
+    current_user: Annotated[
+        dict,
+        Depends(metrics_access),
+    ],
+) -> dict:
+    """Return the aggregate Phase 6.8 metrics snapshot.
+
+    Admin-only (the same trusted ``require_role("admin")`` dependency
+    as the destructive document routes). The payload is the aggregate
+    registry snapshot ONLY: bounded label values plus counts, sums,
+    extremes, and histogram buckets. There are no user IDs, document
+    IDs, request IDs, queries/prompts, or provider error messages in
+    the registry, so none can appear in the response. Snapshot
+    construction is fail-fast by design: an internal copy failure
+    surfaces as an error, never as an empty, misleading snapshot.
+    """
+    # Deferred import keeps the router import graph identical to
+    # pre-6.8 modules (observability is started by main.py at import
+    # time, and the registry itself must not be constructed eagerly
+    # here).
+    from app.core.observability import metrics_payload
+    from app.core.observability import provider_metrics
+
+    return metrics_payload(provider_metrics.snapshot())
+
 
 @router.post(
     "/documents",

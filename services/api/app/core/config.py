@@ -1,5 +1,6 @@
 from functools import lru_cache
 import math
+from typing import Literal
 
 from pydantic import AnyHttpUrl, PostgresDsn, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -54,6 +55,10 @@ def _coerce_int(
 class Settings(BaseSettings):
     app_name: str = "ShopPilot AI API"
     environment: str = "development"
+
+    # Phase 6.8: "text" keeps pre-6.8 logging byte-identical; "json"
+    # renders one JSON object per record (see app.core.observability).
+    log_format: Literal["text", "json"] = "text"
 
     database_url: PostgresDsn
 

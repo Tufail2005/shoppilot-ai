@@ -131,12 +131,12 @@ Completed:
 
 ## Current target:
 
-Phase 6.8 — Observability 
+phase 7 - Conversation memory and LangGraph integration
 
 
 ## Next target:
 
-phase 7 - Conversation memory and LangGraph integration
+phase 8 - Customer pages
 
 
 ## Phase 1 — Foundation (Micro-steps)
@@ -368,8 +368,8 @@ Bound both embedding and generation network calls. Add an overall request deadli
 6.7 — Concurrency and failure handling
 Add provider concurrency limits, bounded retries, and predictable HTTP errors.
 
-6.8 — Observability
-Add structured logs and latency/error metrics.
+6.8 — Observability (complete)
+Add structured logs and latency/error metrics. Shipped: request-ID correlation middleware, `LOG_FORMAT` text/JSON structured logging, the in-process `ProviderMetrics` registry (16 series: provider admission/caller/worker/retry, RAG request, ingestion pipeline + failure stage, document lifecycle), best-effort instrumentation of retries/concurrency/RAG/ingestion/lifecycle, and the admin-only `GET /admin/metrics` aggregate snapshot. `docs/architecture.md` → "Observability (Phase 6.8)".
 
 ✅ Milestone: working RAG app, no agent.
 

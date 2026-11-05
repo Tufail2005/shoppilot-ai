@@ -7,6 +7,7 @@ they only exercise app.services.documents helpers directly.
 
 import asyncio
 import io
+import logging
 import re
 
 import pytest
@@ -20,6 +21,8 @@ from app.services.documents import (
     _derive_title,
     _generate_storage_path,
     _read_upload_limited,
+    _storage_upload_log_fields,
+    _upload_to_storage,
     extract_text,
 )
 
@@ -332,3 +335,155 @@ class TestExtractText:
             extract_text(_ReadOnlyStream())  # type: ignore[arg-type]
 
         assert "binary file-like" in str(exc_info.value)
+
+
+class _FakeStorageBucket:
+    """``storage.from_(bucket)``-alike whose upload always fails."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.upload_calls = 0
+
+    def upload(self, *, path, file, file_options):
+        self.upload_calls += 1
+        raise self._exc
+
+
+class _FakeStorage:
+    def __init__(self, exc: Exception):
+        self.bucket = _FakeStorageBucket(exc)
+
+    def from_(self, bucket):
+        return self.bucket
+
+
+class TestStorageUploadLogFields:
+    """The ``status``/``code`` log fields are hostile untrusted input.
+
+    They come from third-party SDK exception objects, so only a
+    numeric HTTP status and a strictly-shaped short token are allowed
+    through; everything else becomes a static placeholder, and message
+    text, paths, URLs, and reprs never reach the log stream.
+    """
+
+    @pytest.mark.parametrize(
+        ("status_value", "expected"),
+        [
+            (None, None),  # attribute missing
+            (200, 200),  # a fine numeric status
+            (599, 599),  # furthest still-in-range status
+            (True, "unsafe"),  # bool is not a status
+            ("500", "unsafe"),  # numeric string is not a status
+            (50.5, "unsafe"),  # float is not a status
+            (99, "unsafe"),  # below the HTTP range
+            (600, "unsafe"),  # above the HTTP range
+            (-1, "unsafe"),  # negative
+        ],
+    )
+    def test_status_bounds(self, status_value, expected):
+        class _Exc(Exception):
+            status = status_value
+
+        assert _storage_upload_log_fields(_Exc())[0] == expected
+
+    @pytest.mark.parametrize(
+        ("code_value", "expected"),
+        [
+            (None, None),  # attribute missing
+            ("25002", "25002"),  # a plain promoted code
+            ("PGRST-da.tch-01", "PGRST-da.tch-01"),  # allowed punctuation
+            ("a" * 32, "a" * 32),  # exactly at the length limit
+            ("a" * 33, "unsafe"),  # over the length limit
+            ("", "unsafe"),  # empty (no leading safe character)
+            (" has space", "unsafe"),  # leading space
+            ("evil;drop", "unsafe"),  # semicolon
+            ("../etc/passwd", "unsafe"),  # path traversal
+            ("newline\nkey", "unsafe"),  # log-injection newline
+            ("日本語", "unsafe"),  # non-ASCII
+            (25002, "unsafe"),  # non-string
+            (b"25002", "unsafe"),  # bytes
+        ],
+    )
+    def test_code_bounds(self, code_value, expected):
+        class _Exc(Exception):
+            code = code_value
+
+        assert _storage_upload_log_fields(_Exc())[1] == expected
+
+    def test_bare_exception_logs_missing_fields_as_none(self):
+        assert _storage_upload_log_fields(RuntimeError("boom")) == (None, None)
+
+    def test_hostile_attributes_never_reach_the_log_stream(self, caplog):
+        # Everything hostile at once: message text carrying a storage
+        # path and a URL, a status that is actually a path, and a code
+        # that is a log-injection attempt repr'ing an arbitrary object.
+        hostile_message = (
+            "upload failed for uploads/secret-path.pdf "
+            "at https://internal.example.com bucket"
+        )
+
+        class _HostileError(Exception):
+            def __init__(self):
+                super().__init__(hostile_message)
+                self.status = "uploads/secret-path.pdf"
+                self.code = dict({"secret": "key"})  # arbitrary object
+
+        storage = _FakeStorage(_HostileError())
+
+        with caplog.at_level(logging.ERROR, logger="app.services.documents"):
+            with pytest.raises(HTTPException) as exc_info:
+                _upload_to_storage(
+                    storage, "uploads/hostile.pdf", b"%PDF-1.4 fake"
+                )
+
+        # The sanitized HTTP response is preserved exactly.
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == (
+            "Document storage is temporarily unavailable"
+        )
+
+        record = next(
+            record
+            for record in caplog.records
+            if "Storage upload failed" in record.getMessage()
+        )
+        rendered = record.getMessage()
+
+        assert record.levelno == logging.ERROR
+        assert "type=_HostileError" in rendered
+        # Placeholders replaced every malformed attribute; nothing
+        # hostile ever reached the log stream.
+        assert "status=unsafe" in rendered
+        assert "code=unsafe" in rendered
+        assert hostile_message not in rendered
+        assert "uploads/secret-path.pdf" not in rendered
+        assert "internal.example.com" not in rendered
+        assert "secret" not in rendered
+        assert "key" not in rendered
+        assert repr({"secret": "key"}) not in rendered
+
+    def test_well_formed_sdk_fields_are_logged_verbatim(self, caplog):
+        class _SDKLikeError(Exception):
+            status = 413
+            code = "payload_too_large"
+
+        storage = _FakeStorage(_SDKLikeError())
+
+        with caplog.at_level(logging.ERROR, logger="app.services.documents"):
+            with pytest.raises(HTTPException):
+                _upload_to_storage(
+                    storage, "uploads/sdk-like.pdf", b"%PDF-1.4 fake"
+                )
+
+        record = next(
+            record
+            for record in caplog.records
+            if "Storage upload failed" in record.getMessage()
+        )
+        # Committed behavioral contract: type first, then the validated
+        # structured fields with the upload's own log format.
+        assert (
+            record.getMessage()
+            == "Storage upload failed: type=_SDKLikeError "
+            "status=413 code=payload_too_large"
+        )

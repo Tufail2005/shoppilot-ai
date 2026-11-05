@@ -246,6 +246,7 @@ class GeminiGenerationProvider:
                 lambda: self._client.interactions.create(**request_kwargs),
                 policy=self._retry_policy,
                 cancel_event=cancel_event,
+                operation="rag_generation",
             )
         except ProviderCallAborted:
             # Must reach the admission layer unwrapped so it maps to a
@@ -509,6 +510,7 @@ async def generate_rag_answer(
             prompt,
             deadline_at=deadline_at,
             margin=ADMISSION_DEADLINE_MARGIN_SECONDS,
+            operation="rag_generation",
         )
 
     citations = validate_citations(answer_text, prompt.sources)

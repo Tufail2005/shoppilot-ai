@@ -71,12 +71,14 @@ that never restate path-like or vector values.
 import asyncio
 import logging
 import math
+import time
 import uuid
 from collections.abc import Sequence
 
 from psycopg_pool import AsyncConnectionPool
 from storage3 import SyncStorageClient
 
+from app.core.observability import provider_metrics as _provider_metrics
 from app.core.provider_concurrency import (
     ADMISSION_DEADLINE_MARGIN_SECONDS,
     ProviderBusyError,
@@ -355,6 +357,7 @@ async def _embedded(
                 batch_size,
                 deadline_at=deadline_at,
                 margin=ADMISSION_DEADLINE_MARGIN_SECONDS,
+                operation="ingestion_embedding",
             )
         except ProviderBusyError as exc:
             # ProviderBusyError covers ProviderShutdownError: both are
@@ -397,7 +400,103 @@ async def _embedded(
     return vectors
 
 
+def now_seconds() -> float:
+    """The shared Phase 6.8 instrumentation clock (never a decision)."""
+    return time.monotonic()
+
+
+def _record_pipeline(outcome: str, started: float) -> None:
+    """Record one ingestion pipeline outcome and duration; NEVER raise.
+
+    Exactly one terminal observation per document ingestion:
+    ``succeeded``, ``failed`` (any non-cancellation exception), or
+    ``caller_cancelled``.
+    """
+    labels = {"ingestion_outcome": outcome}
+
+    try:
+        _provider_metrics.record_counter(
+            "ingestion_pipelines_total", labels
+        )
+        _provider_metrics.record_duration(
+            "ingestion_pipeline_seconds",
+            labels,
+            now_seconds() - started,
+        )
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
+
+
+def _record_failure_stage(exc: BaseException) -> None:
+    """Record the failure stage of one failed ingestion; NEVER raise.
+
+    Only configured stage slugs are accepted by the registry; anything
+    else (including a stage-less ``ValueError``) records no stage row.
+    The two ``request_cancelled``-adjacent lifecycle stages are never
+    recorded here by design (correction C3).
+    """
+    stage = getattr(exc, "stage", None)
+
+    if not isinstance(stage, str):
+        return
+
+    try:
+        _provider_metrics.record_counter(
+            "ingestion_failure_stages_total", {"stage": stage}
+        )
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
+
+
 async def ingest_document(
+    pool: AsyncConnectionPool,
+    storage: SyncStorageClient,
+    embedding_provider: EmbeddingProvider,
+    *,
+    document_id: uuid.UUID,
+    storage_path: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_OVERLAP,
+    batch_size: int = EMBEDDING_BATCH_SIZE,
+    limiters: ProviderLimiters | None = None,
+    deadline_at: float | None = None,
+) -> int:
+    """Ingest one uploaded document (Phase 6.8: pipeline observed).
+
+    Thin metrics boundary around :func:`_ingest_document`: exactly one
+    terminal pipeline outcome and duration per document, plus the
+    failure stage of a failed pipeline. Recording is best-effort and
+    never changes pipeline order, transaction semantics, or errors.
+    """
+    started = now_seconds()
+
+    try:
+        inserted = await _ingest_document(
+            pool,
+            storage,
+            embedding_provider,
+            document_id=document_id,
+            storage_path=storage_path,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            batch_size=batch_size,
+            limiters=limiters,
+            deadline_at=deadline_at,
+        )
+    except asyncio.CancelledError:
+        _record_pipeline("caller_cancelled", started)
+        raise
+    except Exception as exc:
+        _record_pipeline("failed", started)
+        _record_failure_stage(exc)
+        raise
+
+    _record_pipeline("succeeded", started)
+
+    return inserted
+
+
+async def _ingest_document(
     pool: AsyncConnectionPool,
     storage: SyncStorageClient,
     embedding_provider: EmbeddingProvider,

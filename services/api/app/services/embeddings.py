@@ -273,7 +273,11 @@ class GeminiEmbeddingProvider:
             _format_document_text(text)
             for text in _validated_texts(texts, method="documents")
         )
-        return self._embed(formatted, cancel_event=cancel_event)
+        return self._embed(
+            formatted,
+            cancel_event=cancel_event,
+            operation="ingestion_embedding",
+        )
 
     def embed_query(
         self,
@@ -286,9 +290,25 @@ class GeminiEmbeddingProvider:
             _format_query_text(text)
             for text in _validated_texts(texts, method="query")
         )
-        return self._embed(formatted, cancel_event=cancel_event)
+        return self._embed(
+            formatted,
+            cancel_event=cancel_event,
+            operation="query_embedding",
+        )
 
-    def _embed(self, formatted_texts, *, cancel_event=None) -> list[list[float]]:
+    def _embed(
+        self,
+        formatted_texts,
+        *,
+        cancel_event=None,
+        operation: str,
+    ) -> list[list[float]]:
+        """Embed one batch; ``operation`` labels the retry metrics.
+
+        The intent distinction is propagated explicitly by the two
+        public methods (never inferred inside this shared body), so one
+        code path records two distinct operations.
+        """
         formatted = list(formatted_texts)
 
         # An empty batch must never reach the API.
@@ -312,6 +332,7 @@ class GeminiEmbeddingProvider:
                 ),
                 policy=self._retry_policy,
                 cancel_event=cancel_event,
+                operation=operation,
             )
         except ProviderCallAborted:
             # Must reach the admission layer unwrapped so it maps to a

@@ -8,6 +8,7 @@ so the retry loop is deterministic.
 """
 
 import math
+import threading
 
 import httpx
 import pytest
@@ -25,8 +26,32 @@ from app.core.provider_retry import (
     call_with_retries,
     clamp_retry_after,
     classify_provider_error,
+    provider_outcome_of,
     retry_after_seconds,
 )
+
+
+@pytest.fixture
+def metrics(monkeypatch):
+    """A fresh ProviderMetrics registry wired into the retry module.
+
+    The module-level ``provider_metrics`` singleton stays untouched, so
+    other tests (and the production call sites) are never affected by
+    the assertions here.
+    """
+    from app.core import provider_retry as retry_module
+    from app.core.observability import ProviderMetrics
+
+    registry = ProviderMetrics()
+    monkeypatch.setattr(retry_module, "_provider_metrics", registry)
+    return registry
+
+
+def _operation_count(registry, series, **labels):
+    for entry in registry.snapshot().counters.get(series, []):
+        if entry["labels"] == labels:
+            return entry["value"]
+    return None
 
 
 _REQUEST_URL = "https://generativelanguage.example.invalid/v1/models"
@@ -502,7 +527,9 @@ class TestRetryLoop:
             )
 
         assert calls == [1]
-        assert sleeps == 1
+        # Backoff is delivered in cancellable chunks (<= 0.05 s), so
+        # exactly one chunk is observed before cancellation aborts.
+        assert len(sleeps) == 1
 
     def test_cancellable_backoff_is_chunked(self):
         import threading
@@ -797,3 +824,619 @@ def test_policy_defaults_match_the_documented_bounds():
     assert policy.initial_delay_seconds == 0.25
     assert policy.retry_window_seconds == 3.0
     assert math.isfinite(policy.retry_window_seconds)
+
+
+def _metrics_policy(**overrides) -> RetryPolicy:
+    """A deterministic, fast policy for the metrics tests.
+
+    ``rand=lambda: 0.0`` zeroes the backoff so no sleep happens unless a
+    test installs its own sleep fake.
+    """
+    values = {
+        "max_attempts": 3,
+        "initial_delay_seconds": 0.001,
+        "retry_window_seconds": 3.0,
+    }
+    values.update(overrides)
+
+    return RetryPolicy(**values)
+
+
+def _run(attempt, policy, **overrides):
+    options = {
+        "clock": _Recorder().clock,
+        "sleep": lambda _seconds: None,
+        "rand": lambda: 0.0,
+    }
+    options.update(overrides)
+
+    return call_with_retries(attempt, policy=policy,
+                             **options)
+
+
+class TestRetryMetrics:
+    def test_first_attempt_success_counts_only_the_call(self, metrics):
+        def attempt():
+            return 42
+
+        result = _run(
+            attempt,
+            _metrics_policy(max_attempts=2),
+            operation="query_embedding",
+        )
+
+        assert result == 42
+        assert _operation_count(
+            metrics, "provider_retry_calls_total", operation="query_embedding"
+        ) == 1
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="query_embedding",
+            kind="transient",
+        ) is None
+        assert _operation_count(
+            metrics,
+            "provider_retry_success_total",
+            operation="query_embedding",
+            attempts="1",
+        ) is None
+        assert metrics.snapshot().counters.get(
+            "provider_retry_success_total", []
+        ) == []
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="query_embedding",
+            kind="transient",
+            attempts="1",
+        ) is None
+
+    def test_success_after_one_retry_is_counted_by_total_attempts(
+        self, metrics
+    ):
+        outcomes = [_legacy(429), "ok"]
+
+        def attempt():
+            outcome = outcomes.pop(0)
+
+            if outcome != "ok":
+                raise outcome
+
+            return outcome
+
+        result = _run(
+            attempt, _metrics_policy(), operation="query_embedding"
+        )
+
+        assert result == "ok"
+        # calls: one logical invocation.
+        assert _operation_count(
+            metrics, "provider_retry_calls_total", operation="query_embedding"
+        ) == 1
+        # attempts: the single failed attempt that triggered the retry.
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="query_embedding",
+            kind="rate_limited",
+        ) == 1
+        # success: recovered after one retry, labelled by TOTAL attempts.
+        assert _operation_count(
+            metrics,
+            "provider_retry_success_total",
+            operation="query_embedding",
+            attempts="2",
+        ) == 1
+        assert _operation_count(
+            metrics,
+            "provider_retry_success_total",
+            operation="query_embedding",
+            attempts="1",
+        ) is None
+
+    def test_success_after_multiple_retries_counts_each_failed_attempt(
+        self, metrics
+    ):
+        outcomes = [_legacy(503), _legacy(500), "ok"]
+
+        def attempt():
+            outcome = outcomes.pop(0)
+
+            if outcome != "ok":
+                raise outcome
+
+            return outcome
+
+        result = _run(
+            attempt, _metrics_policy(), operation="query_embedding"
+        )
+
+        assert result == "ok"
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="query_embedding",
+            kind="rate_limited",
+        ) is None
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="query_embedding",
+            kind="transient",
+        ) == 2
+        assert _operation_count(
+            metrics,
+            "provider_retry_success_total",
+            operation="query_embedding",
+            attempts="3",
+        ) == 1
+
+    def test_exhaustion_by_max_attempts_records_exhausted(
+        self, metrics
+    ):
+        def attempt():
+            raise _legacy(503)
+
+        with pytest.raises(ProviderCallError) as raised:
+            _run(
+                attempt,
+                _metrics_policy(max_attempts=2),
+                operation="query_embedding",
+            )
+
+        assert raised.value.kind == KIND_TRANSIENT
+        # The final failure did not trigger another retry, so only the
+        # first (retry-triggering) failure is attributed here.
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="query_embedding",
+            kind="transient",
+        ) == 1
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="query_embedding",
+            kind="transient",
+            attempts="2",
+        ) == 1
+        assert metrics.snapshot().counters.get(
+            "provider_retry_success_total", []
+        ) == []
+
+    def test_window_expiry_before_backoff_records_exhausted(
+        self, metrics
+    ):
+        def attempt():
+            raise _legacy(503)
+
+        with pytest.raises(ProviderCallError):
+            _run(
+                attempt,
+                _metrics_policy(initial_delay_seconds=10.0),
+                rand=lambda: 1.0,
+                operation="ingestion_embedding",
+            )
+
+        # The call ended before any retry attempt began: no attempt
+        # counter, and the exhausted series carries the single attempt.
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="ingestion_embedding",
+            kind="transient",
+        ) is None
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="ingestion_embedding",
+            kind="transient",
+            attempts="1",
+        ) == 1
+
+    def test_window_expiry_during_backoff_records_exhausted(
+        self, metrics
+    ):
+        clock = _Clock(0.0)
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            # The backoff is "real": the clock advances three times the
+            # nominal delay, pushing the window past its expiry.
+            clock.now += seconds * 3
+
+        def attempt():
+            raise _legacy(503)
+
+        with pytest.raises(ProviderCallError):
+            _run(
+                attempt,
+                _metrics_policy(
+                    initial_delay_seconds=0.05,
+                    retry_window_seconds=0.06,
+                ),
+                clock=clock,
+                sleep=sleep,
+                rand=lambda: 1.0,
+                operation="rag_generation",
+            )
+
+        assert sleeps == [0.05]
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="rag_generation",
+            kind="transient",
+        ) is None
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="rag_generation",
+            kind="transient",
+            attempts="1",
+        ) == 1
+
+    def test_timeout_exit_is_non_retriable_but_not_exhaustion(self, metrics):
+        def attempt():
+            raise httpx.ReadTimeout("slow", request=_request())
+
+        with pytest.raises(ProviderCallError) as raised:
+            _run(attempt, _metrics_policy(), operation="query_embedding")
+
+        assert raised.value.kind == KIND_TIMEOUT
+        # The logical call is counted once, but a timeout that is never
+        # retried is NOT retry-budget exhaustion: the counter that
+        # distinguishes exhausted retries stays at zero.
+        assert _operation_count(
+            metrics, "provider_retry_calls_total", operation="query_embedding"
+        ) == 1
+        assert _operation_count(
+            metrics,
+            "provider_retry_attempts_total",
+            operation="query_embedding",
+            kind="timeout",
+        ) is None
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="query_embedding",
+            kind="timeout",
+            attempts="1",
+        ) is None
+        assert metrics.snapshot().counters.get(
+            "provider_retry_exhausted_total", []
+        ) == []
+
+    def test_rate_limited_exhaustion_records_the_kind(self, metrics):
+        def attempt():
+            raise _legacy(429)
+
+        with pytest.raises(ProviderCallError) as raised:
+            _run(
+                attempt,
+                _metrics_policy(max_attempts=2),
+                operation="ingestion_embedding",
+            )
+
+        assert raised.value.kind == KIND_RATE_LIMITED
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="ingestion_embedding",
+            kind="rate_limited",
+            attempts="2",
+        ) == 1
+
+    def test_fatal_exit_is_non_retriable_but_not_exhaustion(self, metrics):
+        def attempt():
+            raise _legacy(400)
+
+        with pytest.raises(ProviderCallError) as raised:
+            _run(attempt, _metrics_policy(), operation="rag_generation")
+
+        assert raised.value.kind == KIND_FATAL
+        # An immediate fatal failure never consults the retry budget,
+        # so it must not be counted as exhaustion — the distinguishing
+        # property a max-attempts exit does have.
+        assert _operation_count(
+            metrics, "provider_retry_calls_total", operation="rag_generation"
+        ) == 1
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="rag_generation",
+            kind="fatal",
+            attempts="1",
+        ) is None
+        assert metrics.snapshot().counters.get(
+            "provider_retry_exhausted_total", []
+        ) == []
+        assert metrics.snapshot().counters.get(
+            "provider_retry_attempts_total",
+            [],
+        ) == []
+
+    def test_retry_budget_reached_on_the_only_attempt_is_exhaustion(
+        self, metrics
+    ):
+        # max_attempts=1: a retriable failure spends the whole budget on
+        # the first attempt. This exit IS exhaustion (unlike the fatal
+        # and timeout exits above, which fail before the budget does).
+        def attempt():
+            raise _legacy(503)
+
+        with pytest.raises(ProviderCallError) as raised:
+            _run(
+                attempt,
+                _metrics_policy(max_attempts=1),
+                operation="query_embedding",
+            )
+
+        assert raised.value.kind == KIND_TRANSIENT
+        assert _operation_count(
+            metrics,
+            "provider_retry_exhausted_total",
+            operation="query_embedding",
+            kind="transient",
+            attempts="1",
+        ) == 1
+        assert metrics.snapshot().counters.get(
+            "provider_retry_attempts_total", []
+        ) == []
+
+    def test_cancel_before_an_attempt_keeps_the_call_counter_default(
+        self, metrics
+    ):
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with pytest.raises(ProviderCallAborted):
+            _run(
+                lambda: 1,
+                _metrics_policy(),
+                cancel_event=cancel_event,
+            )
+
+        # Called without ``operation``: the backward-compatible default
+        # labels the logical call, but failed-attempt/success/exhausted
+        # counters are never touched.
+        assert _operation_count(
+            metrics, "provider_retry_calls_total", operation="unattributed"
+        ) == 1
+        assert metrics.snapshot().counters.get(
+            "provider_retry_attempts_total", []
+        ) == []
+        assert metrics.snapshot().counters.get(
+            "provider_retry_success_total", []
+        ) == []
+        assert metrics.snapshot().counters.get(
+            "provider_retry_exhausted_total", []
+        ) == []
+
+    def test_cancelled_backoff_records_no_attempt_or_exhaustion(
+        self, metrics
+    ):
+        cancel_event = threading.Event()
+
+        def sleep(_seconds):
+            # Cancellation arrives while the backoff is awaited.
+            cancel_event.set()
+
+        def attempt():
+            raise _legacy(503)
+
+        with pytest.raises(ProviderCallAborted):
+            _run(
+                attempt,
+                _metrics_policy(),
+                cancel_event=cancel_event,
+                sleep=sleep,
+                rand=lambda: 0.5,
+                operation="query_embedding",
+            )
+
+        # The cancellation replaces the retry decision: the concurrency
+        # layer records caller_cancelled, so nothing is counted here
+        # beyond the logical call itself.
+        assert _operation_count(
+            metrics, "provider_retry_calls_total", operation="query_embedding"
+        ) == 1
+        assert metrics.snapshot().counters.get(
+            "provider_retry_attempts_total", []
+        ) == []
+        assert metrics.snapshot().counters.get(
+            "provider_retry_success_total", []
+        ) == []
+        assert metrics.snapshot().counters.get(
+            "provider_retry_exhausted_total", []
+        ) == []
+
+    def test_broken_registry_never_affects_retry_behavior(self, monkeypatch):
+        from app.core import provider_retry as retry_module
+
+        class _BrokenRegistry:
+            def record_counter(self, *args, **kwargs):
+                raise RuntimeError("registry exploded")
+
+        monkeypatch.setattr(
+            retry_module, "_provider_metrics", _BrokenRegistry()
+        )
+
+        # A retried call still succeeds...
+        outcomes = [_legacy(503), "ok"]
+
+        def attempt():
+            outcome = outcomes.pop(0)
+
+            if outcome != "ok":
+                raise outcome
+
+            return outcome
+
+        assert _run(attempt, _metrics_policy()) == "ok"
+
+        # ...and an exhausting call still raises its classification.
+        def failing_attempt():
+            raise _legacy(400)
+
+        with pytest.raises(ProviderCallError) as raised:
+            _run(
+                failing_attempt,
+                _metrics_policy(max_attempts=1),
+            )
+
+        assert raised.value.kind == KIND_FATAL
+
+    def test_backward_compatible_default_operation(self, metrics):
+        def attempt():
+            return 7
+
+        # Pre-6.8 call sites never pass ``operation``.
+        assert call_with_retries(
+            attempt,
+            policy=_metrics_policy(),
+            clock=_Recorder().clock,
+            sleep=lambda _seconds: None,
+            rand=lambda: 0.0,
+        ) == 7
+
+        assert _operation_count(
+            metrics, "provider_retry_calls_total", operation="unattributed"
+        ) == 1
+
+
+class TestProviderOutcomeOf:
+    def test_timeout_wins_over_the_provider_call_error_kind(self):
+        # A ProviderCallError whose wrapper chain carries a real
+        # timeout: the chain-aware timeout check must classify first.
+        exc = ProviderCallError(KIND_RATE_LIMITED, attempts=2)
+        exc.__cause__ = httpx.ReadTimeout("slow", request=_request())
+
+        assert provider_outcome_of(exc) == "timeout"
+
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [
+            (KIND_TIMEOUT, "timeout"),
+            (KIND_RATE_LIMITED, "rate_limited"),
+            (KIND_TRANSIENT, "transient"),
+            (KIND_FATAL, "fatal"),
+        ],
+    )
+    def test_known_provider_call_error_kinds_are_preserved(
+        self, kind, expected
+    ):
+        assert provider_outcome_of(ProviderCallError(kind, attempts=1)) == (
+            expected
+        )
+
+    def test_translated_sdk_cause_chain_is_classified(self):
+        # The adapters chain the original SDK cause behind the
+        # translated error; the cause is classified (not the wrapper).
+        from app.services.embeddings import EmbeddingError
+
+        exc = EmbeddingError("simulated")
+        exc.__cause__ = httpx.ConnectError(
+            "boom", request=_request()
+        )
+
+        assert provider_outcome_of(exc) == "transient"
+
+    def test_stage_allowlist_for_embedding_errors(self):
+        from app.services.embeddings import EmbeddingError
+
+        assert (
+            provider_outcome_of(EmbeddingError("x", stage="provider_request"))
+            == "fatal"
+        )
+        assert (
+            provider_outcome_of(
+                EmbeddingError("x", stage="embedding_timeout")
+            )
+            == "timeout"
+        )
+        assert (
+            provider_outcome_of(EmbeddingError("x", stage="rate_limited"))
+            == "rate_limited"
+        )
+        assert (
+            provider_outcome_of(
+                EmbeddingError("x", stage="provider_unavailable")
+            )
+            == "transient"
+        )
+
+    def test_stage_allowlist_for_generation_errors(self):
+        from app.services.generation import GenerationError
+
+        assert (
+            provider_outcome_of(
+                GenerationError("x", stage="generation_timeout")
+            )
+            == "timeout"
+        )
+        assert (
+            provider_outcome_of(GenerationError("x", stage="rate_limited"))
+            == "rate_limited"
+        )
+        assert (
+            provider_outcome_of(
+                GenerationError("x", stage="generation_request")
+            )
+            == "fatal"
+        )
+        assert (
+            provider_outcome_of(GenerationError("x", stage="configuration"))
+            == "fatal"
+        )
+        assert (
+            provider_outcome_of(GenerationError("x", stage="empty_response"))
+            == "fatal"
+        )
+        assert (
+            provider_outcome_of(GenerationError("x", stage="no_sources"))
+            == "fatal"
+        )
+
+    def test_unknown_stage_maps_to_unexpected(self):
+        from app.services.embeddings import EmbeddingError
+
+        assert (
+            provider_outcome_of(
+                EmbeddingError("x", stage="totally_new_stage")
+            )
+            == "unexpected"
+        )
+
+        class _NoneStage(Exception):
+            """An exception family carrying a non-string stage."""
+
+        exc = _NoneStage("x")
+        exc.stage = None
+
+        # A stage of the wrong type is treated as missing.
+        assert provider_outcome_of(exc) == "unexpected"
+
+    def test_unknown_exception_families_map_to_unexpected(self):
+        assert provider_outcome_of(KeyError("missing")) == "unexpected"
+        assert provider_outcome_of(OSError("io")) == "unexpected"
+
+    def test_aborted_calls_are_outside_the_retry_outcome_set(self):
+        assert provider_outcome_of(ProviderCallAborted("cancelled")) == (
+            "unexpected"
+        )
+
+    def test_module_never_imports_concurrency_or_adapter_layers(self):
+        import inspect
+
+        from app.core import provider_retry
+        from app.services import embeddings, generation  # noqa: F401
+
+        source = inspect.getsource(provider_retry)
+
+        assert "provider_concurrency" not in source
+        assert "from app.services" not in source
+        assert "import embeddings" not in source
+        assert "import generation" not in source

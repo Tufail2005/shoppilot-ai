@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import re
 import uuid
 from typing import BinaryIO
 
@@ -9,6 +10,7 @@ from fastapi import HTTPException, UploadFile, status
 from psycopg_pool import AsyncConnectionPool
 from storage3 import SyncStorageClient
 
+from app.core.observability import provider_metrics as _provider_metrics
 from app.core.provider_concurrency import ProviderLimiters
 from app.repositories import documents as documents_repository
 from app.services.embeddings import EmbeddingProvider
@@ -119,6 +121,54 @@ def _generate_storage_path() -> str:
     return f"uploads/{uuid.uuid4()}.pdf"
 
 
+# Bounds of the storage upload failure log's structured attributes.
+# Both are derived from untrusted SDK exception objects, so they are
+# validated before logging: only a numeric HTTP status and a short,
+# strictly-shaped token are allowed through. Anything else — including
+# message text, paths, and arbitrary object reprs — is replaced with a
+# static placeholder. Values that were never set are logged as None.
+_UNSAFE_LOG_PLACEHOLDER = "unsafe"
+_LOGGED_STATUS_CODES = range(100, 600)
+_LOGGED_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
+
+
+def _storage_upload_log_fields(exc: Exception) -> tuple[int | str | None, str | None]:
+    """Sanitized ``(status, code)`` log fields for a Storage error.
+
+    The Storage SDK raises heterogeneous exception objects whose
+    attributes are never trusted input to the log stream: a numeric
+    HTTP status or a short promoted-code token is fine, but anything
+    else (message text, URLs, paths, reprs of arbitrary objects) is
+    reduced to a static placeholder.
+    """
+
+    raw_status = getattr(exc, "status", None)
+    logged_status: int | str | None
+
+    # A bare ``None`` (attribute missing, or the SDK's own "not set")
+    # is logged as None. ``bool`` is a subclass of ``int``: True/False
+    # are not statuses. Strings ("500"), floats, and out-of-range
+    # numbers are never statuses either.
+    if raw_status is None:
+        logged_status = None
+    elif isinstance(raw_status, bool) or not isinstance(raw_status, int):
+        logged_status = _UNSAFE_LOG_PLACEHOLDER
+    elif raw_status in _LOGGED_STATUS_CODES:
+        logged_status = raw_status
+    else:
+        logged_status = _UNSAFE_LOG_PLACEHOLDER
+
+    raw_code = getattr(exc, "code", None)
+    if isinstance(raw_code, str) and _LOGGED_CODE_PATTERN.match(raw_code):
+        logged_code: str | None = raw_code
+    elif raw_code is None:
+        logged_code = None
+    else:
+        logged_code = _UNSAFE_LOG_PLACEHOLDER
+
+    return logged_status, logged_code
+
+
 def _upload_to_storage(
     storage: SyncStorageClient,
     storage_path: str,
@@ -133,10 +183,16 @@ def _upload_to_storage(
     except Exception as exc:
         # Log the stage and exception type only. Storage SDK error
         # messages can contain the internal storage path or bucket URL,
-        # which must never appear in logs.
+        # which must never appear in logs. The SDK's structured fields
+        # are logged only after strict validation (_storage_upload_log_
+        # fields): malformed values become a safe placeholder, and the
+        # exception's message text is never logged.
+        status_field, code_field = _storage_upload_log_fields(exc)
         logger.error(
-            "Storage upload failed: %s",
+            "Storage upload failed: type=%s status=%s code=%s",
             type(exc).__name__,
+            status_field,
+            code_field,
         )
 
         raise HTTPException(
@@ -577,6 +633,47 @@ def _finalized_failure_category(exc: Exception) -> tuple[str, str]:
     return "unexpected", "Document ingestion failed"
 
 
+class _StatusConflictError(Exception):
+    """A guarded terminal status write found no ``processing`` row.
+
+    Raised by :func:`_mark_document_ready` and
+    :func:`_record_ingestion_failure` when a newer terminal status won.
+    The service layer translates it into the SAME sanitized
+    ``HTTPException`` those helpers used to raise directly, so the HTTP
+    contract is unchanged while the lifecycle metric can distinguish a
+    status conflict from a persistence failure.
+    """
+
+    def __init__(self, message: str, *, detail: str):
+        super().__init__(message)
+        self.detail = detail
+
+
+_STATUS_CONFLICT_DETAIL_READY = "Document status could not be finalized"
+_STATUS_CONFLICT_DETAIL_FAILED = (
+    "Document ingestion outcome could not be recorded"
+)
+
+
+def _record_document_lifecycle(outcome: str) -> None:
+    """Record one document lifecycle outcome; NEVER raise.
+
+    Exactly one terminal outcome per registered-document ingest:
+    ``ready``, ``failed``, ``conflict`` (a newer terminal status won),
+    ``cancelled`` (recorded exactly once, where the cancellation is
+    handled — never by the detached marker), or ``unexpected`` (a
+    status-persistence failure). Best-effort: a broken registry can
+    never change persistence, cancellation, or HTTP behavior.
+    """
+    try:
+        _provider_metrics.record_counter(
+            "document_lifecycle_outcomes_total",
+            {"document_lifecycle_outcome": outcome},
+        )
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
+
+
 def _document_id(document: dict) -> uuid.UUID:
     # create_document returns a raw uuid.UUID from psycopg.
     identifier = document["id"]
@@ -635,9 +732,11 @@ async def _mark_document_ready(
             document_id,
         )
 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document status could not be finalized",
+        # Phase 6.8: the conflict raises the internal typed signal; the
+        # service layer keeps raising the identical sanitized 500.
+        raise _StatusConflictError(
+            "no processing row remaining",
+            detail=_STATUS_CONFLICT_DETAIL_READY,
         )
 
     logger.info("Document %s is ready.", document_id)
@@ -687,9 +786,11 @@ async def _record_ingestion_failure(
             document_id,
         )
 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document ingestion outcome could not be recorded",
+        # Phase 6.8: conflict raised as the typed internal signal (same
+        # sanitized HTTP response via the service layer).
+        raise _StatusConflictError(
+            "no processing row remaining",
+            detail=_STATUS_CONFLICT_DETAIL_FAILED,
         )
 
     logger.info(
@@ -826,19 +927,66 @@ async def _ingest_registered_document(
                 deadline_at=deadline_at,
             )
 
+        except asyncio.CancelledError:
+            # Cancellation is handled exactly once, in the outer
+            # handler below.
+            raise
+
         except Exception as exc:
             stage, message = _finalized_failure_category(exc)
 
-            return await _record_ingestion_failure(
-                pool,
-                document_id,
-                stage=stage,
-                message=message,
-            )
+            try:
+                recorded = await _record_ingestion_failure(
+                    pool,
+                    document_id,
+                    stage=stage,
+                    message=message,
+                )
+            except _StatusConflictError as conflict:
+                # A newer terminal status won: the lifecycle outcome is
+                # `conflict`, and the identical sanitized 500 the
+                # helper used to raise propagates unchanged.
+                _record_document_lifecycle("conflict")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=conflict.detail,
+                ) from conflict
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The failure could not be persisted: not `failed`,
+                # not a conflict — the outcome itself is unknown.
+                _record_document_lifecycle("unexpected")
+                raise
+
+            _record_document_lifecycle("failed")
+            return recorded
 
         # Finalization is now inside the outer cancellation boundary.
-        return await _mark_document_ready(pool, document_id)
+        try:
+            finalized = await _mark_document_ready(pool, document_id)
+        except _StatusConflictError as conflict:
+            _record_document_lifecycle("conflict")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=conflict.detail,
+            ) from conflict
+        except asyncio.CancelledError:
+            # Cancellation during finalization is handled exactly once
+            # in the outer handler below.
+            raise
+        except Exception:
+            # Status persistence failed; the document's terminal
+            # outcome is neither ready nor visibly failed.
+            _record_document_lifecycle("unexpected")
+            raise
+
+        _record_document_lifecycle("ready")
+        return finalized
 
     except asyncio.CancelledError:
         _record_cancellation(pool, document_id)
+        # Exactly one lifecycle observation for this cancellation; the
+        # detached marker task must never record a second one.
+        _record_document_lifecycle("cancelled")
         raise

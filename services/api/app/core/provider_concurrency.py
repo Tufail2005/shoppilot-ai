@@ -61,6 +61,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from asyncio import ensure_future
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -68,13 +69,23 @@ from typing import Literal, TypeVar
 
 from fastapi import Request
 
+from app.core.observability import provider_metrics as _provider_metrics
 from app.core.provider_retry import ProviderCallAborted
+from app.core.provider_retry import provider_outcome_of
 from app.core.provider_timeouts import validate_timeout_seconds
 
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+# Retried-outcome buckets (Phase 6.8): a worker failure classified into
+# one of these retry-layer outcomes is a known provider failure for the
+# coarse caller buckets; anything else is unexpected.
+_RETRIED_OUTCOMES = frozenset(
+    {"timeout", "rate_limited", "transient", "fatal"}
+)
+_UNATTRIBUTED = "unattributed"
 
 # Canonical acquisition order. Every caller is normalised into this
 # order, so a multi-permit acquisition can never create a cycle.
@@ -309,6 +320,199 @@ def get_provider_limiters(request: Request) -> ProviderLimiters:
 # ---------------------------------------------------------------------------
 # Admission internals
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.8 provider-call metrics (best-effort observation only)
+# ---------------------------------------------------------------------------
+
+
+def _now() -> float:
+    """The shared instrumentation clock (never used for decisions)."""
+    return time.monotonic()
+
+
+def _record_counter(
+    series: str,
+    labels: dict[str, str],
+) -> None:
+    """Record one counter observation; NEVER alter admission behavior.
+
+    ``ProviderMetrics`` recording is best-effort by contract; this
+    wrapper adds a boundary against a broken/replaced registry so a
+    metrics failure can never surface in admission, cancellation,
+    shutdown, or results.
+    """
+    try:
+        _provider_metrics.record_counter(series, labels)
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
+
+
+def _record_duration(
+    series: str,
+    labels: dict[str, str],
+    seconds: float,
+) -> None:
+    """Record one duration observation; NEVER alter admission behavior."""
+    try:
+        _provider_metrics.record_duration(series, labels, seconds)
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
+
+
+def _record_admission(
+    operation: str,
+    resource: str,
+    admission_outcome: str,
+    wait_seconds: float,
+) -> None:
+    """Record one per-resource admission observation (counter + wait)."""
+    labels = {"operation": operation, "resource": resource}
+
+    _record_counter(
+        "provider_admissions_total",
+        {**labels, "admission_outcome": admission_outcome},
+    )
+    _record_duration(
+        "provider_admission_wait_seconds",
+        labels,
+        wait_seconds,
+    )
+
+
+def _record_worker(
+    operation: str,
+    resource: str,
+    worker_outcome: str,
+    seconds: float,
+) -> None:
+    """Record one worker observation (counter + duration)."""
+    labels = {
+        "operation": operation,
+        "resource": resource,
+        "worker_outcome": worker_outcome,
+    }
+
+    _record_counter("provider_worker_outcomes_total", labels)
+    _record_duration("provider_worker_seconds", labels, seconds)
+
+
+def _caller_outcome_of(exc: BaseException) -> str:
+    """Map one escaping exception to its coarse caller bucket.
+
+    Admission refusals are precise (shutdown vs saturation); anything a
+    worker raised is bucketed through the retry layer's outcome mapping
+    (correction C1: coarse buckets at the caller, never adapter
+    imports).
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return "caller_cancelled"
+
+    if isinstance(exc, (ProviderShutdownError, ProviderCallAborted)):
+        return "shutdown"
+
+    if isinstance(exc, ProviderBusyError):
+        return "saturated"
+
+    if provider_outcome_of(exc) in _RETRIED_OUTCOMES:
+        return "provider_failure"
+
+    return "unexpected"
+
+
+class _CallerObservation:
+    """Records exactly one coarse caller outcome and call duration.
+
+    ``finish`` is idempotent by construction (exactly-once guard), so
+    even a defensive duplicate site can never produce two rows.
+    """
+
+    __slots__ = ("_operation", "_started", "_finished")
+
+    def __init__(self, operation: str, started: float):
+        self._operation = operation
+        self._started = started
+        self._finished = False
+
+    def finish(self, caller_outcome: str) -> None:
+        if self._finished:
+            return
+
+        self._finished = True
+
+        labels = {
+            "operation": self._operation,
+            "caller_outcome": caller_outcome,
+        }
+
+        _record_counter("provider_caller_outcomes_total", labels)
+        _record_duration(
+            "provider_call_seconds", labels, _now() - self._started
+        )
+
+
+def _on_worker_metrics(
+    task: asyncio.Task,
+    operation: str,
+    resource: str,
+    cancel_event,
+    limiters: "ProviderLimiters",
+    started_at: float,
+) -> None:
+    """Record one worker outcome and duration; never raises.
+
+    Registered AFTER ``_on_worker_done`` and BEFORE the completion
+    future's ``_settle`` callback, so permits are already released when
+    this runs (callback order follows registration order) and the late
+    outcome path is untouched. ``task.cancelled()`` is checked BEFORE
+    ``task.exception()``: retrieving an exception from a cancelled task
+    re-raises instead of returning ``None``.
+
+    The outcome is observed even when the caller detached (request
+    cancellation never stops the worker), so caller cancellation and
+    detached worker completion are separate observations.
+
+    Worker outcome mapping:
+
+    - the task was cancelled outright      -> ``worker_aborted``,
+    - the cancel event is set DURING a
+      process shutdown                     -> ``shutdown`` (the outcome
+      is discarded exactly as before),
+    - a caller cancellation WITHOUT a
+      process shutdown never overrides
+      what the worker actually did         -> ``succeeded`` for a clean
+      return; an exception is classified
+      through the retry layer's outcome
+      (``timeout``/``rate_limited``/``transient``/``fatal``, else
+      ``unexpected``),
+    - the worker raised ``ProviderCallAborted`` (retry loop observed
+      cancellation)                        -> ``shutdown`` under a
+      process shutdown, else ``worker_aborted``,
+    - a clean return                       -> ``succeeded``.
+    """
+    try:
+        shutting_down = limiters.shutting_down.is_set()
+
+        if task.cancelled():
+            outcome = "worker_aborted"
+        elif cancel_event.is_set() and shutting_down:
+            outcome = "shutdown"
+        else:
+            exc = task.exception()
+
+            if exc is None:
+                outcome = "succeeded"
+            elif isinstance(exc, ProviderCallAborted):
+                outcome = (
+                    "shutdown" if shutting_down else "worker_aborted"
+                )
+            else:
+                outcome = provider_outcome_of(exc)
+
+        _record_worker(operation, resource, outcome, _now() - started_at)
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
 
 
 def _canonical_resources(resources: str | Sequence[str]) -> list[str]:
@@ -608,33 +812,72 @@ async def _acquire_one(
     resource: str,
     limiters: ProviderLimiters,
     admission_deadline: float,
+    *,
+    operation: str = _UNATTRIBUTED,
 ) -> None:
-    if limiters.shutting_down.is_set():
-        raise ProviderShutdownError(resource)
+    """Acquire one permit; observe its admission and wait.
 
-    remaining = admission_deadline - asyncio.get_running_loop().time()
-
-    if remaining <= 0:
-        raise ProviderBusyError(resource)
-
-    # Fast path: available now. The permit is taken in this coroutine
-    # with no suspension point, so no helper task and no waiter slot
-    # are needed and no concurrent arrival can slip in between.
-    if not semaphore.locked():
-        await semaphore.acquire()
-        return
-
-    # Slow path: guaranteed to wait, therefore it must be counted.
-    lease = limiters._acquire_pending_lease(resource)
-
-    if lease is None:
-        raise ProviderBusyError(resource)
+    Phase 6.8: every acquisition is observed exactly once with a
+    single ``admission_outcome`` (per the METRIC vocabulary: both
+    timed-out and pending-cap refusals are ``saturated``) and the
+    wall-clock wait it actually spent, including instant refusals
+    (wait ≈ 0). Recording is best-effort and never raises.
+    """
+    started = _now()
+    outcome = "unexpected"
 
     try:
-        await _wait_for_permit(semaphore, resource, limiters, remaining, lease)
+        if limiters.shutting_down.is_set():
+            outcome = "shutdown"
+            raise ProviderShutdownError(resource)
+
+        remaining = admission_deadline - asyncio.get_running_loop().time()
+
+        if remaining <= 0:
+            outcome = "saturated"
+            raise ProviderBusyError(resource)
+
+        # Fast path: available now. The permit is taken in this coroutine
+        # with no suspension point, so no helper task and no waiter slot
+        # are needed and no concurrent arrival can slip in between.
+        if not semaphore.locked():
+            await semaphore.acquire()
+            outcome = "acquired"
+            return
+
+        # Slow path: guaranteed to wait, therefore it must be counted.
+        lease = limiters._acquire_pending_lease(resource)
+
+        if lease is None:
+            outcome = "saturated"
+            raise ProviderBusyError(resource)
+
+        try:
+            await _wait_for_permit(
+                semaphore, resource, limiters, remaining, lease
+            )
+        finally:
+            # No-op once the callback owns the lease.
+            lease.release()
+
+        outcome = "acquired"
+    except asyncio.CancelledError:
+        # A caller cancellation delivers CancelledError here (the
+        # acquisition task's own outcome is drained below it); an
+        # interrupted wait is caller cancellation, never a refusal.
+        outcome = "caller_cancelled"
+        raise
+    except ProviderShutdownError:
+        outcome = "shutdown"
+        raise
+    except ProviderBusyError:
+        outcome = "saturated"
+        raise
+    except Exception:
+        outcome = "unexpected"
+        raise
     finally:
-        # No-op once the callback owns the lease.
-        lease.release()
+        _record_admission(operation, resource, outcome, _now() - started)
 
 
 def _on_worker_done(task: asyncio.Task, limiters: ProviderLimiters) -> None:
@@ -660,6 +903,7 @@ async def run_bounded(
     wait_seconds: float | None = None,
     deadline_at: float | None = None,
     margin: float = 0.0,
+    operation: str = _UNATTRIBUTED,
 ) -> _T:
     """Run one provider call under admission control.
 
@@ -667,14 +911,29 @@ async def run_bounded(
     ``cancel_event=``. ``resources`` lists every permit the call needs;
     they are acquired in canonical order under ONE admission deadline
     computed here (never two sequential budgets).
+
+    Phase 6.8: the call is observed — one coarse caller outcome and
+    duration (``provider_caller_outcomes_total`` /
+    ``provider_call_seconds``), one per-resource admission observation
+    per permit (``provider_admissions_total`` /
+    ``provider_admission_wait_seconds``), and one worker outcome and
+    duration delivered by the worker's done callback
+    (``provider_worker_outcomes_total`` / ``provider_worker_seconds``),
+    attributed to the admission's primary resource. ``operation``
+    labels the logical caller path for all of these and defaults to
+    ``unattributed``. Recording is best-effort and never changes
+    admission, cancellation, shutdown, or permit-release behavior.
     """
     names = _canonical_resources(resources)
     primary = names[0]
+
+    observation = _CallerObservation(operation, _now())
 
     loop = asyncio.get_running_loop()
     now = loop.time()
 
     if limiters.shutting_down.is_set():
+        observation.finish("shutdown")
         raise ProviderShutdownError(primary)
 
     budget = (
@@ -689,6 +948,7 @@ async def run_bounded(
         admission_deadline = min(admission_deadline, deadline_at - margin)
 
     if admission_deadline <= now:
+        observation.finish("saturated")
         raise ProviderBusyError(primary)
 
     acquired: list[asyncio.BoundedSemaphore] = []
@@ -696,10 +956,17 @@ async def run_bounded(
     try:
         for name in names:
             semaphore = limiters.semaphore_for(name)
-            await _acquire_one(semaphore, name, limiters, admission_deadline)
+            await _acquire_one(
+                semaphore,
+                name,
+                limiters,
+                admission_deadline,
+                operation=operation,
+            )
             acquired.append(semaphore)
-    except BaseException:
+    except BaseException as exc:
         _release_all(acquired)
+        observation.finish(_caller_outcome_of(exc))
         raise
 
     # --- await-free critical section ------------------------------------
@@ -708,6 +975,7 @@ async def run_bounded(
     # (which only runs at await points) cannot interleave.
     if limiters.shutting_down.is_set():
         _release_all(acquired)
+        observation.finish("shutdown")
         raise ProviderShutdownError(primary)
 
     scope = ProviderCallScope(
@@ -715,16 +983,33 @@ async def run_bounded(
         permits=tuple(acquired),
     )
 
+    worker_started_at = _now()
+
     try:
         task = loop.create_task(
             asyncio.to_thread(fn, *args, cancel_event=scope.cancel_event)
         )
     except BaseException:
         _release_all(acquired)
+        observation.finish("unexpected")
         raise
 
     limiters._inflight[task] = scope
+    # Permit release must stay first: done callbacks run in
+    # registration order, so permits are released before the worker
+    # outcome is observed, and the completion future's late-outcome
+    # handling is untouched (exactly-once permit release preserved).
     task.add_done_callback(lambda done: _on_worker_done(done, limiters))
+    task.add_done_callback(
+        lambda done: _on_worker_metrics(
+            done,
+            operation,
+            primary,
+            scope.cancel_event,
+            limiters,
+            worker_started_at,
+        )
+    )
 
     waiter = _completion_future(task, loop)
 
@@ -733,18 +1018,27 @@ async def run_bounded(
     except asyncio.CancelledError:
         # Stop further retries; the worker keeps running and its permit
         # is released by the callback when the thread returns.
+        observation.finish("caller_cancelled")
         scope.cancel()
         _abandon_waiter(waiter)
         raise
     except ProviderCallAborted as exc:
         # A live request must never surface this as an unknown 500.
+        observation.finish("shutdown")
         raise ProviderShutdownError(primary) from exc
+    except Exception as exc:
+        # A worker failure that reached the caller: bucketed coarsely
+        # through the retry layer's outcome mapping (correction C1).
+        observation.finish(_caller_outcome_of(exc))
+        raise
 
     if scope.cancel_event.is_set():
         # Shutdown cancelled this call while it was in flight. A worker
         # that returns anyway (it may be inside an uninterruptible SDK
         # call) has an outcome that must not be served to a request
         # whose process is going down.
+        observation.finish("shutdown")
         raise ProviderShutdownError(primary)
 
+    observation.finish("succeeded")
     return result

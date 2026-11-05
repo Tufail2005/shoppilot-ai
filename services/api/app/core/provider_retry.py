@@ -6,6 +6,21 @@ window limits when another attempt may start; each running attempt is
 bounded by its provider timeout. ``Retry-After`` is advisory.
 
 The clock, sleep, and randomness are injectable for deterministic tests.
+
+Phase 6.8: retries are metrics-instrumented. Every logical invocation
+increments ``provider_retry_calls_total``; a failed attempt increments
+``provider_retry_attempts_total{kind}`` only when the next attempt
+actually begins; a success after at least one retry increments
+``provider_retry_success_total`` (total attempts, so ``"1"``, a
+first-try success, never appears); a call whose retry budget is
+spent — ``max_attempts`` reached, or the retry window preventing
+another attempt — increments ``provider_retry_exhausted_total``
+(final kind + total attempts). Immediate fatal errors, timeouts,
+and cancellations are non-retriable exits, not exhaustion.
+Recording is best-effort: it can never change decisions,
+results, or exceptions. ``operation`` labels the logical caller path.
+Also exposes :func:`provider_outcome_of` for the concurrency worker
+layer (retry-layer outcome vocabulary only).
 """
 
 from __future__ import annotations
@@ -17,6 +32,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, TypeVar
 
+from app.core.observability import attempts_label
+from app.core.observability import provider_metrics as _provider_metrics
 from app.core.provider_timeouts import is_timeout_error
 
 
@@ -327,6 +344,76 @@ def clamp_retry_after(seconds: object) -> int:
     )
 
 
+# Retry-layer outcome vocabulary for the worker done-callbacks. The
+# concurrency layer resolves its own outcomes (caller cancellation,
+# saturation, shutdown, worker abort) BEFORE consulting this function,
+# so the concurrency exception types are deliberately never
+# referenced here (correction C1), and no adapter exception class is
+# ever imported (correction C2) — the adapters reach this function
+# through standard exception attributes only.
+_KIND_TO_OUTCOME = {
+    KIND_TIMEOUT: "timeout",
+    KIND_RATE_LIMITED: "rate_limited",
+    KIND_TRANSIENT: "transient",
+    KIND_FATAL: "fatal",
+}
+
+# Explicit stage allowlist (correction C2). The slugs are the ones the
+# adapters actually set; they are duplicated here on purpose so the
+# retry layer stays free of adapter imports. Unknown families and
+# unknown/missing stages map to "unexpected".
+_STAGE_TO_OUTCOME = {
+    "embedding_timeout": "timeout",
+    "generation_timeout": "timeout",
+    "rate_limited": "rate_limited",
+    "provider_unavailable": "transient",
+    "provider_request": "fatal",
+    "generation_request": "fatal",
+    "configuration": "fatal",
+    "empty_response": "fatal",
+    "unsuccessful_response": "fatal",
+    "empty_output": "fatal",
+    "no_sources": "fatal",
+}
+
+
+def provider_outcome_of(exc: BaseException) -> str:
+    """Classify an observed exception into the retry-layer outcome set.
+
+    Returns one of ``timeout``, ``rate_limited``, ``transient``,
+    ``fatal``, or ``unexpected``. Rules in strict order:
+
+    1. timeouts first, using the chain-aware :func:`is_timeout_error`
+       helper (a wrapped timeout can never be Downgraded to a retryable
+       kind),
+    2. a known :class:`ProviderCallError` keeps its classification,
+    3. the translated exception's SDK cause is classified,
+    4. a translated adapter error's ``stage`` slug is mapped through
+       the explicit allowlist,
+    5. anything else — unknown exception families, unknown stages,
+       missing stages, concurrency-layer exception types — is
+       ``unexpected``.
+    """
+    if is_timeout_error(exc):
+        return "timeout"
+
+    if isinstance(exc, ProviderCallError):
+        return _KIND_TO_OUTCOME.get(exc.kind, "unexpected")
+
+    cause = exc.__cause__
+
+    if cause is not None:
+        kind = classify_provider_error(cause)
+
+        if kind in _KIND_TO_OUTCOME:
+            return _KIND_TO_OUTCOME[kind]
+
+    if isinstance(getattr(exc, "stage", None), str):
+        return _STAGE_TO_OUTCOME.get(exc.stage, "unexpected")
+
+    return "unexpected"
+
+
 def _backoff_delay(
     policy: RetryPolicy,
     attempt: int,
@@ -363,6 +450,52 @@ def _sleep_with_cancel(
         remaining -= step
 
 
+# ---------------------------------------------------------------------------
+# Phase 6.8 retry metrics (best-effort recording only)
+# ---------------------------------------------------------------------------
+
+_RETRY_CALLS = "provider_retry_calls_total"
+_RETRY_ATTEMPTS = "provider_retry_attempts_total"
+_RETRY_SUCCESS = "provider_retry_success_total"
+_RETRY_EXHAUSTED = "provider_retry_exhausted_total"
+
+
+def _record_counter(
+    series: str,
+    labels: dict[str, str],
+    *,
+    delta: int = 1,
+) -> None:
+    """Record one counter observation; NEVER affect retry behavior.
+
+    ``ProviderMetrics`` recording is best-effort by contract; this
+    wrapper adds a boundary against a broken/replaced registry so a
+    metrics failure can never surface in retry decisions, results, or
+    exception chaining.
+    """
+    try:
+        _provider_metrics.record_counter(series, labels, delta=delta)
+    except Exception:  # pragma: no cover - metrics must be invisible
+        pass
+
+
+def _record_exhausted(operation: str, kind: str, attempts: int) -> None:
+    """Record one call whose retry budget is spent.
+
+    Called only when ``max_attempts`` has been reached or the retry
+    window prevents another attempt — never for immediate
+    non-retriable exits (fatal errors, timeouts) or cancellations.
+    """
+    _record_counter(
+        _RETRY_EXHAUSTED,
+        {
+            "operation": operation,
+            "kind": kind,
+            "attempts": attempts_label(attempts),
+        },
+    )
+
+
 def call_with_retries(
     attempt: Callable[[], _T],
     *,
@@ -371,6 +504,7 @@ def call_with_retries(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     rand: Callable[[], float] = random.random,
+    operation: str = "unattributed",
 ) -> _T:
     """Run one logical provider call under the bounded retry policy.
 
@@ -378,9 +512,34 @@ def call_with_retries(
     the classification of the final failure, or
     :class:`ProviderCallAborted` when cancellation is observed before an
     attempt or during backoff.
+
+    ``operation`` (keyword-only, Phase 6.8) labels the logical caller
+    path for the retry metrics and defaults to ``unattributed`` so
+    pre-6.8 call sites keep working unchanged.
+
+    Metrics semantics:
+
+    - ``provider_retry_calls_total{operation}``: every logical call,
+    - ``provider_retry_attempts_total{operation, kind}``: every failed
+      attempt whose retry actually began (a cancellation-interrupted
+      backoff is therefore recorded by the concurrency layer, not here),
+    - ``provider_retry_success_total{operation, attempts}``: successes
+      recovered after at least one retry, labelled by TOTAL attempts
+      (initial included, so ``"1"`` never appears),
+    - ``provider_retry_exhausted_total{operation, kind, attempts}``:
+      calls whose retry budget is spent — ``max_attempts`` reached,
+      or the retry window preventing another attempt (both the
+      pre-backoff check and the post-backoff check). Immediate fatal
+      errors, timeouts, and cancellations are NOT exhaustion: the
+      retry budget never came into play.
+
+    Recording is best-effort and never alters decisions, chaining, or
+    results.
     """
     started_at = clock()
     attempts = 0
+
+    _record_counter(_RETRY_CALLS, {"operation": operation})
 
     while True:
         if cancel_event is not None and cancel_event.is_set():
@@ -390,7 +549,7 @@ def call_with_retries(
         attempts += 1
 
         try:
-            return attempt()
+            value = attempt()
         except ProviderCallAborted:
             raise
         except Exception as exc:
@@ -398,14 +557,28 @@ def call_with_retries(
             hint = retry_after_seconds(exc)
 
             if kind == KIND_TIMEOUT:
-                # Provider timeouts are never retried.
+                # Provider timeouts are never retried. This is a
+                # non-retriable failure, not retry-budget exhaustion:
+                # the exhausted counter stays untouched.
                 raise ProviderCallError(
                     KIND_TIMEOUT,
                     attempts=attempts,
                     retry_after_seconds=hint,
                 ) from exc
 
-            if kind == KIND_FATAL or attempts >= policy.max_attempts:
+            if kind == KIND_FATAL:
+                # Fatal errors are never retried. Like a timeout, this
+                # immediate non-retriable exit is not exhaustion.
+                raise ProviderCallError(
+                    kind,
+                    attempts=attempts,
+                    retry_after_seconds=hint,
+                ) from exc
+
+            if attempts >= policy.max_attempts:
+                # The attempt budget is spent: no further attempt can
+                # follow.
+                _record_exhausted(operation, kind, attempts)
                 raise ProviderCallError(
                     kind,
                     attempts=attempts,
@@ -420,6 +593,7 @@ def call_with_retries(
             elapsed = clock() - started_at
 
             if elapsed + delay >= policy.retry_window_seconds:
+                _record_exhausted(operation, kind, attempts)
                 raise ProviderCallError(
                     kind,
                     attempts=attempts,
@@ -441,8 +615,36 @@ def call_with_retries(
                     "provider call was cancelled during backoff")
 
             if clock() - started_at >= policy.retry_window_seconds:
+                _record_exhausted(operation, kind, attempts)
                 raise ProviderCallError(
                     kind,
                     attempts=attempts,
                     retry_after_seconds=hint,
                 ) from exc
+
+            # The next attempt actually begins: only now is this failed
+            # attempt attributed to its classification. A backoff that
+            # was interrupted by cancellation instead ends this call as
+            # aborted, and the concurrency layer records
+            # caller_cancelled for it.
+            _record_counter(
+                _RETRY_ATTEMPTS,
+                {"operation": operation, "kind": kind},
+            )
+
+            continue
+
+        # Only a completed attempt reaches this point.
+        if attempts >= 2:
+            # Recovered after at least one retry, labelled by the TOTAL
+            # attempt count (the initial attempt included, so "1" never
+            # appears here by construction).
+            _record_counter(
+                _RETRY_SUCCESS,
+                {
+                    "operation": operation,
+                    "attempts": attempts_label(attempts),
+                },
+            )
+
+        return value

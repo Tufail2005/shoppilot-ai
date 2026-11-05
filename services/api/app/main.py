@@ -5,9 +5,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import get_current_user
 from app.core.config import settings
+from app.core.observability import CorrelationMiddleware, configure_logging
 from app.core.provider_concurrency import ProviderLimiters
 from app.db import init_db
 from app.routers import admin, orders, products, rag, tickets
+
+# Phase 6.8 (steps 1-2): activate the logging mode once, before the app
+# exists. "text" (the default) is a no-op, so this line cannot change
+# any pre-existing behavior.
+configure_logging(settings.log_format)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,6 +47,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Phase 6.8 (steps 1-2): pure ASGI correlation middleware. Added after
+# CORS so it sits outside it on the middleware stack (a pure ASGI
+# middleware awaits the downstream app in the same task, so the
+# request ID covers every dependency and service below it).
+app.add_middleware(CorrelationMiddleware)
 
 app.include_router(products.router)
 app.include_router(orders.router)

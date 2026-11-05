@@ -1023,3 +1023,72 @@ class TestBoundedRetries:
             initial_delay_seconds=0.25,
             retry_window_seconds=3.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.8 retry-metrics operation labels
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def retry_metrics(monkeypatch):
+    """A fresh ProviderMetrics registry wired into the retry module.
+
+    The module-level singleton is never touched, so other tests (and
+    the production call sites) remain unaffected.
+    """
+    from app.core import provider_retry as retry_module
+    from app.core.observability import ProviderMetrics
+
+    registry = ProviderMetrics()
+    monkeypatch.setattr(retry_module, "_provider_metrics", registry)
+    return registry
+
+
+def _operation_count(registry, series, **labels):
+    for entry in registry.snapshot().counters.get(series, []):
+        if entry["labels"] == labels:
+            return entry["value"]
+    return None
+
+
+class TestRetryOperationLabels:
+    """The generation path records the approved rag_generation label."""
+
+    def test_generate_records_the_rag_generation_operation(
+        self, retry_metrics
+    ):
+        api = SequencedInteractionsApi([_transient_generation_error()])
+        provider = _retrying_generation_provider(api)
+
+        answer = provider.generate(_prompt())
+
+        assert answer
+        assert _operation_count(
+            retry_metrics,
+            "provider_retry_calls_total",
+            operation="rag_generation",
+        ) == 1
+        assert _operation_count(
+            retry_metrics,
+            "provider_retry_attempts_total",
+            operation="rag_generation",
+            kind="transient",
+        ) == 1
+        assert _operation_count(
+            retry_metrics,
+            "provider_retry_success_total",
+            operation="rag_generation",
+            attempts="2",
+        ) == 1
+        # The embedding operations are never recorded by this path.
+        assert _operation_count(
+            retry_metrics,
+            "provider_retry_calls_total",
+            operation="query_embedding",
+        ) is None
+        assert _operation_count(
+            retry_metrics,
+            "provider_retry_calls_total",
+            operation="ingestion_embedding",
+        ) is None

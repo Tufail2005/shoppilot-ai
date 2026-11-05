@@ -235,6 +235,7 @@ async def retrieve(
             [query],
             deadline_at=deadline_at,
             margin=ADMISSION_DEADLINE_MARGIN_SECONDS,
+            operation="query_embedding",
         )
 
     if not isinstance(vectors, Sequence) or isinstance(vectors, (str, bytes)):
