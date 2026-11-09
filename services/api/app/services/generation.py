@@ -46,17 +46,19 @@ Invalid citation behavior (explicitly chosen safe behavior)
 ----------------------------------------------------------
 
 ``validate_citations`` recognizes only the Phase 6.2 numbered citation
-syntax (``[1]``, ``[2]``, ...) and maps each number exclusively to the
-sources present in the prompt's ``sources`` tuple. A reference the
-model invents — out of range (``[7]`` when five sources exist), zero
+syntax — single markers (``[1]``, ``[2]``, ...) and bracketed number
+lists (``[1, 2]``) — and maps each number exclusively to the sources
+present in the prompt's ``sources`` tuple. A reference the model
+invents — out of range (``[7]`` when five sources exist), zero
 (``[0]``), or beyond the retrieved set — is EXCLUDED from the returned
 citation list: an unknown reference can never produce a citation object
-for a chunk that was not retrieved. The answer text itself is returned
-unchanged in Phase 6.3: this step validates citations structurally
-(they point at real retrieved chunks) but does NOT police or rewrite
-the prose. KNOWN LIMITATION for Phase 14.7: a model may emit prose or
-invalid citations that slide past this structural check; Phase 14.7
-owns broader output validation.
+for a chunk that was not retrieved. The same invented markers are also
+removed from the answer text (all other text is preserved unchanged),
+so the returned answer and citation list are consistent by
+construction: every ``[n]`` marker left in ``answer`` corresponds to
+exactly one returned citation object, and vice versa. This is the
+structural citation-text guarantee; the prose itself is otherwise NOT
+policed, and Phase 14.7 still owns broader output validation.
 
 Also note the explicit distinction recorded here: a citation list built
 from ``[n]`` markers proves only that the model USED the numbering
@@ -367,28 +369,38 @@ def _validated_sources(sources: object) -> tuple[SourceReference, ...]:
     return tuple(sources)
 
 
-_CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+_CITATION_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
 def validate_citations(
     answer_text: str,
     sources: Sequence[SourceReference],
-) -> tuple[Citation, ...]:
+) -> tuple[str, tuple[Citation, ...]]:
     """Map ``[n]`` citations in `answer_text` to the retrieved sources.
 
-    Scans the generated text for the Phase 6.2 numbered citation syntax
-    and resolves each number AGAINST `sources` — the authoritative
-    number-to-chunk mapping built by ``build_rag_prompt``. Rules:
+    Recognizes the Phase 6.2 numbered citation syntax — single markers
+    (``[1]``) and bracketed number lists (``[1, 2]``) — and resolves
+    every number against `sources`, the authoritative number-to-chunk
+    mapping built by ``build_rag_prompt``. Returns the cleaned answer
+    text paired with the validated citations so the response contract
+    holds by construction:
+
+        set(markers in the cleaned answer) == set(citation numbers)
+
+    Rules:
 
     - only sources actually present in `sources` can produce a
       citation; every ``SourceReference`` field is copied unchanged,
     - repeated citations are deduplicated, keeping the
-      FIRST-APPEARANCE order of the scan,
-    - out-of-range numbers (``0``, beyond the retrieved count) are
-      excluded without error, so a model-invented reference can never
-      produce a citation object for a chunk that was not retrieved, and
-    - invalid references never alter the answer text (Phase 14.7 owns
-      stricter output enforcement).
+      FIRST-APPEARANCE order of the scan, while repeated valid markers
+      remain in the text,
+    - numbers that do not map to a retrieved source (``0``, beyond the
+      retrieved count, or invented by the model) are removed from the
+      answer text AND excluded from the citation list, so an invented
+      reference can never leave a dangling marker or produce a citation
+      object for a chunk that was not retrieved, and
+    - all other text is preserved unchanged (Phase 14.7 still owns
+      broader output validation; Phase 15 owns grounding quality).
 
     The function is pure and offline.
     """
@@ -399,31 +411,59 @@ def validate_citations(
 
     citations: list[Citation] = []
     seen: set[int] = set()
+    cleaned: list[str] = []
+    last_end = 0
 
     for match in _CITATION_PATTERN.finditer(text):
-        number = int(match.group(1))
+        numbers = [int(part) for part in match.group(1).split(",")]
 
-        if number in seen:
-            continue
+        for number in numbers:
+            if number in seen:
+                continue
 
-        source = by_number.get(number)
+            source = by_number.get(number)
 
-        if source is None:
-            # Unknown reference: excluded, never fabricated.
-            continue
+            if source is None:
+                # Unknown reference: excluded, never fabricated.
+                continue
 
-        seen.add(number)
-        citations.append(
-            Citation(
-                number=source.number,
-                chunk_id=source.chunk_id,
-                document_id=source.document_id,
-                document_title=source.document_title,
-                chunk_index=source.chunk_index,
+            seen.add(number)
+            citations.append(
+                Citation(
+                    number=source.number,
+                    chunk_id=source.chunk_id,
+                    document_id=source.document_id,
+                    document_title=source.document_title,
+                    chunk_index=source.chunk_index,
+                )
             )
-        )
 
-    return tuple(citations)
+        # Valid markers stay in the text with their original numbers;
+        # only numbers with no matching retrieved source are removed.
+        retained = [str(number) for number in numbers if number in by_number]
+        segment = text[last_end:match.start()]
+
+        if retained:
+            cleaned.append(segment)
+            cleaned.append("[" + ", ".join(retained) + "]")
+        else:
+            # A removed marker can leave a doubled space between the
+            # surrounding words: drop one when whitespace abuts the
+            # removed span on both sides.
+            if (
+                segment
+                and segment[-1].isspace()
+                and match.end() < len(text)
+                and text[match.end()].isspace()
+            ):
+                segment = segment[:-1]
+            cleaned.append(segment)
+
+        last_end = match.end()
+
+    cleaned.append(text[last_end:])
+
+    return "".join(cleaned), tuple(citations)
 
 
 @dataclass(frozen=True)
@@ -456,6 +496,10 @@ async def generate_rag_answer(
     the single reusable seam Phase 6.4's route will call. Empty
     retrieval NEVER calls the model: the answer is exactly
     ``INSUFFICIENT_EVIDENCE_MESSAGE`` with no citations.
+
+    The returned ``answer`` is the generated text as cleaned by
+    ``validate_citations``: invented ``[n]`` markers are removed there,
+    so every marker that remains matches exactly one returned citation.
 
     `user_role` must come from trusted server-side profile data (the
     Phase 3 ``require_role`` dependency), never from the request; it is
@@ -513,7 +557,10 @@ async def generate_rag_answer(
             operation="rag_generation",
         )
 
-    citations = validate_citations(answer_text, prompt.sources)
+    # Citations are validated against the prompt sources and the answer
+    # text is cleaned of invented ``[n]`` markers, so the response can
+    # never carry a dangling citation reference.
+    answer_text, citations = validate_citations(answer_text, prompt.sources)
 
     logger.info(
         "RAG generation produced %d citation(s).",

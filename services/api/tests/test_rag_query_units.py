@@ -17,6 +17,7 @@ sanitized error mapping, log sanitization, and provider configuration.
 
 import asyncio
 import logging
+import re
 import uuid
 from types import SimpleNamespace
 
@@ -80,6 +81,22 @@ def _chunk_dict() -> dict:
         "chunk_index": 0,
         "content": "Returns are accepted within 30 days.",
         "distance": 0.05,
+    }
+
+
+# The Phase 6.2 citation syntax: single markers and bracketed number
+# lists. Used to express the response invariant that every marker left
+# in the final answer has a matching returned citation object.
+_ANSWER_MARKER_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+
+def _answer_marker_numbers(answer: str) -> set[int]:
+    """Every citation number referenced by ``[n]``/``[n, m]`` markers."""
+
+    return {
+        int(part)
+        for match in _ANSWER_MARKER_PATTERN.finditer(answer)
+        for part in match.group(1).split(",")
     }
 
 
@@ -402,12 +419,14 @@ class TestSuccessfulPipeline:
 
         assert response.status_code == 200
         body = response.json()
+
+        # [9] is out of range: removed from the answer text, never
+        # fabricated as a citation object.
         assert body["answer"] == (
             "The return window is 30 days [1]; shipping takes "
-            "3-5 business days [2] [9]."
+            "3-5 business days [2] ."
         )
 
-        # [9] is out of range: excluded, never fabricated.
         assert [citation["number"] for citation in body["citations"]] == [1, 2]
 
         by_number = {citation["number"]: citation for citation in body["citations"]}
@@ -418,6 +437,46 @@ class TestSuccessfulPipeline:
         assert by_number[2]["chunk_id"] == str(second[0])
         assert by_number[2]["document_id"] == str(second[1])
         assert by_number[2]["chunk_index"] == second[4]
+
+    def test_final_response_has_no_marker_without_a_matching_citation(
+        self, harness
+    ):
+        # Response contract invariant: every ``[n]`` marker remaining in
+        # the final answer corresponds to exactly one returned citation
+        # object, returned citation numbers are unique, and all returned
+        # citations map to retrieved chunks.
+        first = _row()
+        second = _row(visibility="internal", chunk_index=3)
+        harness.cursor.rows = [first, second]
+        harness.generation = StubGenerationProvider(
+            answer=(
+                "Return window is 30 days [1], also [2], invented [7]"
+                " and a list [1, 9]."
+            )
+        )
+
+        response = harness.post({"query": _QUERY})
+
+        assert response.status_code == 200
+        body = response.json()
+
+        assert body["answer"] == (
+            "Return window is 30 days [1], also [2], invented and "
+            "a list [1]."
+        )
+
+        numbers = [citation["number"] for citation in body["citations"]]
+        assert numbers == [1, 2]
+        assert len(numbers) == len(set(numbers))
+
+        first_chunk_by_number = {1: first, 2: second}
+        for citation in body["citations"]:
+            row = first_chunk_by_number[citation["number"]]
+            assert citation["chunk_id"] == str(row[0])
+            assert citation["document_id"] == str(row[1])
+
+        # The invariant: answer markers == returned citation numbers.
+        assert _answer_marker_numbers(body["answer"]) == set(numbers)
 
     def test_generation_receives_the_built_prompt(self, harness):
         harness.cursor.rows = [_row()]

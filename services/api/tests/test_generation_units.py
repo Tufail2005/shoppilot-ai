@@ -7,6 +7,7 @@ requests and replays canned responses. No live Gemini call is made.
 """
 
 import asyncio
+import re
 import threading
 from types import SimpleNamespace
 
@@ -370,9 +371,11 @@ class TestProviderTimeouts:
 class TestCitationValidation:
     def test_valid_references_map_to_correct_source_references(self):
         prompt = _prompt()
+        text = "Details [2] and [1]."
 
-        citations = validate_citations("Details [2] and [1].", prompt.sources)
+        answer, citations = validate_citations(text, prompt.sources)
 
+        assert answer == text
         assert [(c.number, c.chunk_id, c.document_id) for c in citations] == [
             (2, "chunk-2", "doc-2"),
             (1, "chunk-1", "doc-1"),
@@ -382,7 +385,7 @@ class TestCitationValidation:
         prompt = _prompt()
         reference = prompt.sources[0]
 
-        (citation,) = validate_citations("[1]", prompt.sources)
+        _, (citation,) = validate_citations("[1]", prompt.sources)
 
         assert isinstance(citation, Citation)
         assert citation.number == reference.number
@@ -391,55 +394,112 @@ class TestCitationValidation:
         assert citation.document_title == reference.document_title
         assert citation.chunk_index == reference.chunk_index
 
-    def test_repeated_citations_deduplicate_in_first_appearance_order(self):
+    def test_repeated_valid_markers_remain_and_citations_deduplicate(self):
         prompt = _prompt()
+        text = "[2] then [1] then [2]."
 
-        citations = validate_citations("[2] then [1] then [2].", prompt.sources)
+        answer, citations = validate_citations(text, prompt.sources)
 
+        assert answer == text
         assert [c.number for c in citations] == [2, 1]
 
     @pytest.mark.parametrize(
-        "answer_text",
+        ("answer_text", "expected_answer"),
         [
-            "[7]",
-            "[0]",
-            "[99]",
-            "A sentence with no reference markers.",
-            "A sentence mentioning reference [7] inside prose.",
+            ("[7]", ""),
+            ("[0]", ""),
+            ("[99]", ""),
+            (
+                "A sentence with no reference markers.",
+                "A sentence with no reference markers.",
+            ),
+            (
+                "A sentence mentioning reference [7] inside prose.",
+                "A sentence mentioning reference inside prose.",
+            ),
         ],
     )
-    def test_invalid_or_unknown_references_are_excluded(self, answer_text):
+    def test_invalid_or_unknown_references_are_removed(
+        self, answer_text, expected_answer
+    ):
         prompt = build_rag_prompt(_PROMPT_QUERY, _PROMPT_CHUNKS)
 
-        citations = validate_citations(answer_text, prompt.sources)
+        answer, citations = validate_citations(answer_text, prompt.sources)
 
+        assert answer == expected_answer
         assert citations == ()
+        assert re.search(r"\[\d+", answer) is None
+
+    def test_answer_with_only_invalid_markers_leaves_no_dangling_marker(self):
+        prompt = _prompt()
+
+        answer, citations = validate_citations(
+            "Unsupported [0] claims [7] and [99].", prompt.sources
+        )
+
+        assert answer == "Unsupported claims and ."
+        assert citations == ()
+        assert re.search(r"\[\d+", answer) is None
 
     def test_mixed_valid_and_invalid_references_keep_only_valid_ones(self):
         prompt = _prompt()
+        text = "Claim [3] and [1] and [42]."
 
-        citations = validate_citations(
-            "Claim [3] and [1] and [42].", prompt.sources
+        answer, citations = validate_citations(text, prompt.sources)
+
+        assert answer == "Claim and [1] and ."
+        assert [c.number for c in citations] == [1]
+
+    def test_bracketed_list_keeps_only_mapped_numbers(self):
+        # The confirmed Phase 6 defect reproduction shape: one mapped and
+        # one invented number inside a single bracketed list. The mapped
+        # reference stays, the invented one is removed.
+        chunks = [
+            *_PROMPT_CHUNKS,
+            {
+                **_PROMPT_CHUNKS[0],
+                "id": "chunk-3",
+                "document_id": "doc-3",
+                "chunk_index": 5,
+            },
+        ]
+        prompt = build_rag_prompt(_PROMPT_QUERY, chunks)
+
+        answer, citations = validate_citations(
+            "The return window is 7 days [3, 4].", prompt.sources
         )
 
-        assert [c.number for c in citations] == [1]
+        assert answer == "The return window is 7 days [3]."
+        assert [c.number for c in citations] == [3]
+
+    def test_answer_without_citation_markers_is_unchanged(self):
+        prompt = _prompt()
+        text = "Plain prose with no reference markers at all."
+
+        answer, citations = validate_citations(text, prompt.sources)
+
+        assert answer == text
+        assert citations == ()
 
     def test_unknown_reference_never_fabricates_a_citation_object(self):
         only_one_chunk = build_rag_prompt(_PROMPT_QUERY, _PROMPT_CHUNKS[:1])
 
-        citations = validate_citations(
-            "Answering [1] but the model also claims [2].", only_one_chunk.sources
+        answer, citations = validate_citations(
+            "Answering [1] but the model also claims [2].",
+            only_one_chunk.sources,
         )
 
+        assert answer == "Answering [1] but the model also claims ."
         assert [c.number for c in citations] == [1]
         assert all(
             c.chunk_id == "chunk-1" for c in citations
         )
 
-    def test_empty_sources_produce_no_citations(self):
-        citations = validate_citations("[1] [2]", ())
+    def test_empty_sources_produce_no_citations_and_no_markers(self):
+        answer, citations = validate_citations("[1] [2]", ())
 
         assert citations == ()
+        assert re.search(r"\[\d+", answer) is None
 
     def test_non_string_answer_fails_with_type_error(self):
         prompt = _prompt()
@@ -452,11 +512,11 @@ class TestCitationValidation:
         # list says nothing about factual support; Phase 14.7/15 own
         # deeper checks. A text full of citations validates cleanly.
         prompt = _prompt()
+        text = "[1] [2] unsupported claim [1] [2]."
 
-        citations = validate_citations(
-            "[1] [2] unsupported claim [1] [2].", prompt.sources
-        )
+        answer, citations = validate_citations(text, prompt.sources)
 
+        assert answer == text
         assert [c.number for c in citations] == [1, 2]
 
 
@@ -545,6 +605,39 @@ class TestGenerateRagAnswer:
         assert len(generator.requests) == 1
         assert generator.requests[0].question == _PROMPT_QUERY
         assert len(generator.requests[0].sources) == len(chunk_dicts)
+
+    def test_full_generation_removes_invented_citation_marker(
+        self, monkeypatch
+    ):
+        chunk_dicts = _PROMPT_CHUNKS
+
+        async def fake_retrieve(
+            pool, provider, *, query, user_role, limiters=None, deadline_at=None
+        ):
+            return chunk_dicts
+
+        monkeypatch.setattr(
+            generation_module.retrieval_service, "retrieve", fake_retrieve
+        )
+        generator = StubGenerationProvider(
+            "Returns take 30 days. [1] and invented [9]."
+        )
+
+        result = asyncio.run(
+            generate_rag_answer(
+                RecordingRetrievalPool(),
+                StubEmbeddingProvider(),
+                generator,
+                query=_PROMPT_QUERY,
+                user_role="customer",
+            )
+        )
+
+        assert isinstance(result, RagAnswer)
+        # The invented [9] marker is removed; every remaining marker
+        # maps to exactly one returned citation.
+        assert result.answer == "Returns take 30 days. [1] and invented ."
+        assert [c.number for c in result.citations] == [1]
 
     def test_empty_retrieval_returns_exact_message_without_generation_call(
         self, monkeypatch
